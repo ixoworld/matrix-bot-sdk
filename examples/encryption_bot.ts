@@ -1,5 +1,5 @@
 import * as fs from "fs";
-import { StoreType } from "@matrix-org/matrix-sdk-crypto-nodejs";
+import { StoreType } from "@ixo/matrix-sdk-crypto-nodejs";
 
 import {
     EncryptionAlgorithm,

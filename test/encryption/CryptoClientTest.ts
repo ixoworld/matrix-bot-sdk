@@ -316,6 +316,243 @@ describe('CryptoClient', () => {
                 expect(e.message).toEqual("End-to-end encryption has not initialized");
             }
         });
+
+        // Tests for backup recovery - these test the logic without requiring full crypto setup
+        describe('backup recovery logic', () => {
+            it('should attempt key recovery when decryption fails with missing key error', () => testCryptoStores(async (cryptoStoreType) => {
+                const { client, http } = createTestClient(null, userId, cryptoStoreType);
+                await client.cryptoStore.setDeviceId(TEST_DEVICE_ID);
+
+                bindNullEngine(http);
+                await Promise.all([
+                    client.crypto.prepare([]),
+                    http.flushAllExpected(),
+                ]);
+
+                const mockEvent = {
+                    raw: {
+                        type: "m.room.encrypted",
+                        room_id: "!room:example.org",
+                        content: {
+                            algorithm: "m.megolm.v1.aes-sha2",
+                            session_id: "test_session",
+                            ciphertext: "encrypted",
+                        },
+                    },
+                    megolmProperties: {
+                        session_id: "test_session",
+                    },
+                };
+
+                // Mock backup manager
+                const mockBackupManager = {
+                    importSessionKeyFromBackup: simple.stub().resolveWith(false),
+                };
+                (client.crypto as any).backupManager = mockBackupManager;
+
+                // Mock doDecryptRoomEvent to fail with missing key error
+                let decryptCallCount = 0;
+                (client.crypto as any).doDecryptRoomEvent = simple.stub().callFn(() => {
+                    decryptCallCount++;
+                    throw new Error("MegolmDecryptionError: Unable to decrypt message");
+                });
+
+                try {
+                    await client.crypto.decryptRoomEvent(mockEvent as any, "!room:example.org");
+                    throw new Error("Should have thrown");
+                } catch (e) {
+                    // Should have attempted backup recovery
+                    expect(mockBackupManager.importSessionKeyFromBackup.callCount).toBe(1);
+                    expect(mockBackupManager.importSessionKeyFromBackup.lastCall.args[0]).toBe("!room:example.org");
+                    expect(mockBackupManager.importSessionKeyFromBackup.lastCall.args[1]).toBe("test_session");
+                }
+            }));
+
+            it('should retry decryption after successful key recovery', () => testCryptoStores(async (cryptoStoreType) => {
+                const { client, http } = createTestClient(null, userId, cryptoStoreType);
+                await client.cryptoStore.setDeviceId(TEST_DEVICE_ID);
+
+                bindNullEngine(http);
+                await Promise.all([
+                    client.crypto.prepare([]),
+                    http.flushAllExpected(),
+                ]);
+
+                const mockEvent = {
+                    raw: {
+                        type: "m.room.encrypted",
+                        room_id: "!room:example.org",
+                        content: {
+                            algorithm: "m.megolm.v1.aes-sha2",
+                            session_id: "test_session",
+                            ciphertext: "encrypted",
+                        },
+                    },
+                    megolmProperties: {
+                        session_id: "test_session",
+                    },
+                };
+
+                // Mock backup manager that successfully imports
+                const mockBackupManager = {
+                    importSessionKeyFromBackup: simple.stub().resolveWith(true),
+                };
+                (client.crypto as any).backupManager = mockBackupManager;
+
+                // Mock doDecryptRoomEvent to fail first, then succeed
+                let decryptCallCount = 0;
+                const decryptedEvent = {
+                    raw: {
+                        type: "m.room.message",
+                        room_id: "!room:example.org",
+                        content: { body: "Hello" },
+                    },
+                };
+                (client.crypto as any).doDecryptRoomEvent = simple.stub().callFn(() => {
+                    decryptCallCount++;
+                    if (decryptCallCount === 1) {
+                        throw new Error("MegolmDecryptionError: Unable to decrypt message");
+                    }
+                    return decryptedEvent;
+                });
+
+                const result = await client.crypto.decryptRoomEvent(mockEvent as any, "!room:example.org");
+
+                // Should have retried after successful key import
+                expect(decryptCallCount).toBe(2);
+                expect(mockBackupManager.importSessionKeyFromBackup.callCount).toBe(1);
+                expect(result).toBe(decryptedEvent);
+            }));
+
+            it('should not attempt recovery when backup manager is not configured', () => testCryptoStores(async (cryptoStoreType) => {
+                const { client, http } = createTestClient(null, userId, cryptoStoreType);
+                await client.cryptoStore.setDeviceId(TEST_DEVICE_ID);
+
+                bindNullEngine(http);
+                await Promise.all([
+                    client.crypto.prepare([]),
+                    http.flushAllExpected(),
+                ]);
+
+                const mockEvent = {
+                    raw: {
+                        type: "m.room.encrypted",
+                        room_id: "!room:example.org",
+                        content: {
+                            algorithm: "m.megolm.v1.aes-sha2",
+                            session_id: "test_session",
+                        },
+                    },
+                    megolmProperties: {
+                        session_id: "test_session",
+                    },
+                };
+
+                // No backup manager configured
+                (client.crypto as any).backupManager = null;
+
+                // Mock doDecryptRoomEvent to fail
+                (client.crypto as any).doDecryptRoomEvent = simple.stub().callFn(() => {
+                    throw new Error("MegolmDecryptionError: Unable to decrypt message");
+                });
+
+                try {
+                    await client.crypto.decryptRoomEvent(mockEvent as any, "!room:example.org");
+                    throw new Error("Should have thrown");
+                } catch (e) {
+                    expect(e.message).toContain("MegolmDecryptionError");
+                }
+            }));
+
+            it('should throw original error when backup recovery fails', () => testCryptoStores(async (cryptoStoreType) => {
+                const { client, http } = createTestClient(null, userId, cryptoStoreType);
+                await client.cryptoStore.setDeviceId(TEST_DEVICE_ID);
+
+                bindNullEngine(http);
+                await Promise.all([
+                    client.crypto.prepare([]),
+                    http.flushAllExpected(),
+                ]);
+
+                const mockEvent = {
+                    raw: {
+                        type: "m.room.encrypted",
+                        room_id: "!room:example.org",
+                        content: {
+                            algorithm: "m.megolm.v1.aes-sha2",
+                            session_id: "test_session",
+                        },
+                    },
+                    megolmProperties: {
+                        session_id: "test_session",
+                    },
+                };
+
+                // Mock backup manager that fails to recover
+                const mockBackupManager = {
+                    importSessionKeyFromBackup: simple.stub().rejectWith(new Error("Network error")),
+                };
+                (client.crypto as any).backupManager = mockBackupManager;
+
+                // Mock doDecryptRoomEvent to fail
+                (client.crypto as any).doDecryptRoomEvent = simple.stub().callFn(() => {
+                    throw new Error("MegolmDecryptionError: Unable to decrypt message");
+                });
+
+                try {
+                    await client.crypto.decryptRoomEvent(mockEvent as any, "!room:example.org");
+                    throw new Error("Should have thrown");
+                } catch (e) {
+                    // Should throw original decryption error, not backup error
+                    expect(e.message).toContain("MegolmDecryptionError");
+                }
+            }));
+
+            it('should not attempt recovery for non-missing-key errors', () => testCryptoStores(async (cryptoStoreType) => {
+                const { client, http } = createTestClient(null, userId, cryptoStoreType);
+                await client.cryptoStore.setDeviceId(TEST_DEVICE_ID);
+
+                bindNullEngine(http);
+                await Promise.all([
+                    client.crypto.prepare([]),
+                    http.flushAllExpected(),
+                ]);
+
+                const mockEvent = {
+                    raw: {
+                        type: "m.room.encrypted",
+                        room_id: "!room:example.org",
+                        content: {
+                            algorithm: "m.megolm.v1.aes-sha2",
+                            session_id: "test_session",
+                        },
+                    },
+                    megolmProperties: {
+                        session_id: "test_session",
+                    },
+                };
+
+                // Mock backup manager
+                const mockBackupManager = {
+                    importSessionKeyFromBackup: simple.stub().resolveWith(true),
+                };
+                (client.crypto as any).backupManager = mockBackupManager;
+
+                // Mock doDecryptRoomEvent to fail with a different error
+                (client.crypto as any).doDecryptRoomEvent = simple.stub().callFn(() => {
+                    throw new Error("Some other error");
+                });
+
+                try {
+                    await client.crypto.decryptRoomEvent(mockEvent as any, "!room:example.org");
+                    throw new Error("Should have thrown");
+                } catch (e) {
+                    // Should NOT attempt backup recovery for non-missing-key errors
+                    expect(mockBackupManager.importSessionKeyFromBackup.callCount).toBe(0);
+                    expect(e.message).toBe("Some other error");
+                }
+            }));
+        });
     });
 
     describe('encryptMedia', () => {

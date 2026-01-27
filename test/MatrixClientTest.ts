@@ -1,6 +1,6 @@
 import * as tmp from "tmp";
 import * as simple from "simple-mock";
-import { StoreType } from "@matrix-org/matrix-sdk-crypto-nodejs";
+import { StoreType } from "@ixo/matrix-sdk-crypto-nodejs";
 
 import {
     EventKind,
