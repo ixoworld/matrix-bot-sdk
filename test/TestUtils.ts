@@ -1,6 +1,6 @@
 import * as tmp from "tmp";
 import HttpBackend from "matrix-mock-request";
-import { StoreType } from "@matrix-org/matrix-sdk-crypto-nodejs";
+import { StoreType } from "@ixo/matrix-sdk-crypto-nodejs";
 
 import { IStorageProvider, MatrixClient, RustSdkCryptoStorageProvider, setRequestFn } from "../src";
 

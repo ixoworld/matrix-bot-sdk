@@ -4,7 +4,7 @@ import * as mkdirp from "mkdirp";
 import * as path from "path";
 import * as sha512 from "hash.js/lib/hash/sha/512";
 import * as sha256 from "hash.js/lib/hash/sha/256";
-import { StoreType as RustSdkCryptoStoreType } from "@matrix-org/matrix-sdk-crypto-nodejs";
+import { StoreType as RustSdkCryptoStoreType } from "@ixo/matrix-sdk-crypto-nodejs";
 
 import { ICryptoStorageProvider } from "./ICryptoStorageProvider";
 import { IAppserviceCryptoStorageProvider } from "./IAppserviceStorageProvider";

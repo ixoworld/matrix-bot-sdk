@@ -6,7 +6,7 @@ import {
     RoomId,
     Attachment,
     EncryptedAttachment,
-} from "@matrix-org/matrix-sdk-crypto-nodejs";
+} from "@ixo/matrix-sdk-crypto-nodejs";
 
 import { MatrixClient } from "../MatrixClient";
 import { LogService } from "../logging/LogService";
@@ -26,6 +26,18 @@ import { EncryptedFile } from "../models/events/MessageEvent";
 import { RustSdkCryptoStorageProvider } from "../storage/RustSdkCryptoStorageProvider";
 import { RustEngine, SYNC_LOCK_NAME } from "./RustEngine";
 import { MembershipEvent } from "../models/events/MembershipEvent";
+import { BackupManager, KeyBackupInfo, BackupTrustInfo } from "./BackupManager";
+
+/**
+ * Configuration options for the crypto client.
+ */
+export interface CryptoClientConfig {
+    /**
+     * Base64-encoded recovery key for key backup.
+     * If provided, enables automatic key backup and recovery.
+     */
+    recoveryKey?: string;
+}
 
 /**
  * Manages encryption for a MatrixClient. Get an instance from a MatrixClient directly
@@ -39,9 +51,12 @@ export class CryptoClient {
     private deviceCurve25519: string;
     private roomTracker: RoomTracker;
     private engine: RustEngine;
+    private backupManager: BackupManager | null = null;
+    private config: CryptoClientConfig;
 
-    public constructor(private client: MatrixClient) {
+    public constructor(private client: MatrixClient, config?: CryptoClientConfig) {
         this.roomTracker = new RoomTracker(this.client);
+        this.config = config || {};
     }
 
     private get storage(): RustSdkCryptoStorageProvider {
@@ -107,6 +122,49 @@ export class CryptoClient {
         this.deviceEd25519 = identity.ed25519.toBase64();
 
         LogService.debug("CryptoClient", "Running with device Ed25519 identity:", this.deviceEd25519); // info so all bots know for debugging
+
+        // Initialize key backup if recovery key is provided
+        if (this.config.recoveryKey) {
+            LogService.info("CryptoClient", "Initializing key backup with provided recovery key");
+            this.backupManager = new BackupManager(
+                this.engine.machine,
+                this.client,
+                this.config.recoveryKey,
+            );
+            this.engine.setBackupManager(this.backupManager);
+
+            try {
+                const result = await this.backupManager.checkKeyBackupAndEnable();
+                if (result) {
+                    LogService.info("CryptoClient", `Key backup enabled: version ${result.backupInfo.version}`);
+                } else {
+                    LogService.info("CryptoClient", "No usable key backup found on server");
+                }
+            } catch (e) {
+                LogService.warn("CryptoClient", "Error enabling key backup:", e);
+            }
+
+            // After backup is enabled, check if this is a fresh crypto store
+            // If so, bulk restore all keys from backup before syncing
+            try {
+                const counts = await this.backupManager.getRoomKeyCounts();
+                if (counts.total === 0) {
+                    LogService.info("CryptoClient", "Fresh crypto store detected, restoring keys from backup...");
+                    const activeVersion = await this.backupManager.getActiveBackupVersion();
+                    if (activeVersion) {
+                        const restoreResult = await this.backupManager.restoreKeyBackup();
+                        LogService.info("CryptoClient", `Bulk restore complete: imported ${restoreResult.imported}/${restoreResult.total} keys`);
+                    } else {
+                        LogService.debug("CryptoClient", "No active backup version, skipping bulk restore");
+                    }
+                } else {
+                    LogService.debug("CryptoClient", `Crypto store has ${counts.total} keys, skipping bulk restore`);
+                }
+            } catch (e) {
+                // Don't fail startup if bulk restore fails - on-demand fetch will still work
+                LogService.warn("CryptoClient", "Failed to bulk restore keys from backup:", e);
+            }
+        }
 
         this.ready = true;
     }
@@ -186,6 +244,11 @@ export class CryptoClient {
             }
 
             await this.engine.run();
+
+            // Trigger backup upload if new keys were received
+            if (this.backupManager) {
+                await this.backupManager.maybeUploadKey();
+            }
         });
     }
 
@@ -244,6 +307,10 @@ export class CryptoClient {
 
     /**
      * Decrypts a room event. Currently only supports Megolm-encrypted events (default for this SDK).
+     *
+     * If decryption fails due to a missing key and key backup is enabled, this method will
+     * automatically attempt to fetch the missing key from the backup and retry decryption.
+     *
      * @param {EncryptedRoomEvent} event The encrypted event.
      * @param {string} roomId The room ID where the event was sent.
      * @returns {Promise<RoomEvent<unknown>>} Resolves to a decrypted room event, or rejects/throws with
@@ -251,6 +318,45 @@ export class CryptoClient {
      */
     @requiresReady()
     public async decryptRoomEvent(event: EncryptedRoomEvent, roomId: string): Promise<RoomEvent<unknown>> {
+        try {
+            return await this.doDecryptRoomEvent(event, roomId);
+        } catch (e: any) {
+            // Check if this is a missing key error and we have backup enabled
+            const errorMessage = e?.message || String(e);
+            LogService.debug("CryptoClient", `Decryption error: "${errorMessage}"`);
+
+            const isMissingKeyError = errorMessage.includes("MegolmDecryptionError") ||
+                                       errorMessage.includes("UnknownMessageIndex") ||
+                                       errorMessage.includes("missing key") ||
+                                       errorMessage.includes("Unable to decrypt") ||
+                                       errorMessage.includes("Can't find the room key");
+
+            if (isMissingKeyError && this.backupManager) {
+                const sessionId = event.megolmProperties?.session_id;
+                if (sessionId) {
+                    LogService.info("CryptoClient", `Decryption failed for session ${sessionId}, attempting key recovery from backup`);
+
+                    try {
+                        const imported = await this.backupManager.importSessionKeyFromBackup(roomId, sessionId);
+                        if (imported) {
+                            LogService.info("CryptoClient", `Successfully recovered key for session ${sessionId}, retrying decryption`);
+                            return await this.doDecryptRoomEvent(event, roomId);
+                        }
+                    } catch (backupError) {
+                        LogService.warn("CryptoClient", `Failed to recover key from backup for session ${sessionId}:`, backupError);
+                    }
+                }
+            }
+
+            // Re-throw the original error if backup recovery didn't help
+            throw e;
+        }
+    }
+
+    /**
+     * Internal method to perform the actual decryption.
+     */
+    private async doDecryptRoomEvent(event: EncryptedRoomEvent, roomId: string): Promise<RoomEvent<unknown>> {
         const decrypted = await this.engine.machine.decryptRoomEvent(JSON.stringify(event.raw), new RoomId(roomId));
         const clearEvent = JSON.parse(decrypted.event);
 
@@ -292,5 +398,68 @@ export class CryptoClient {
         );
         const decrypted = Attachment.decrypt(encrypted);
         return Buffer.from(decrypted);
+    }
+
+    // ==================== Key Backup Methods ====================
+
+    /**
+     * Check if key backup is enabled.
+     * @returns True if key backup is enabled and active.
+     */
+    @requiresReady()
+    public async isKeyBackupEnabled(): Promise<boolean> {
+        if (!this.backupManager) return false;
+        return await this.backupManager.isBackupEnabled();
+    }
+
+    /**
+     * Get the current backup version info from the server.
+     * @returns The backup info or null if no backup exists.
+     */
+    @requiresReady()
+    public async getKeyBackupInfo(): Promise<KeyBackupInfo | null> {
+        if (!this.backupManager) return null;
+        return await this.backupManager.requestKeyBackupVersion();
+    }
+
+    /**
+     * Get the currently active backup version.
+     * @returns The backup version string or null if backup is not active.
+     */
+    @requiresReady()
+    public async getActiveBackupVersion(): Promise<string | null> {
+        if (!this.backupManager) return null;
+        return await this.backupManager.getActiveBackupVersion();
+    }
+
+    /**
+     * Get the current room key backup progress.
+     * @returns The total and backed up key counts.
+     */
+    @requiresReady()
+    public async getKeyBackupProgress(): Promise<{ total: number; backedUp: number } | null> {
+        if (!this.backupManager) return null;
+        return await this.backupManager.getRoomKeyCounts();
+    }
+
+    /**
+     * Manually trigger a check for key backup on the server and enable if trusted.
+     * This is automatically called during prepare() if a recovery key is configured.
+     * @returns The backup info and trust status, or null if no usable backup.
+     */
+    @requiresReady()
+    public async checkKeyBackupAndEnable(): Promise<{ backupInfo: KeyBackupInfo; trustInfo: BackupTrustInfo } | null> {
+        if (!this.backupManager) {
+            throw new Error("Key backup not configured - provide recoveryKey in CryptoClientConfig");
+        }
+        return await this.backupManager.checkKeyBackupAndEnable();
+    }
+
+    /**
+     * Get the backup manager instance for advanced operations.
+     * @returns The BackupManager or null if not configured.
+     */
+    public getBackupManager(): BackupManager | null {
+        return this.backupManager;
     }
 }

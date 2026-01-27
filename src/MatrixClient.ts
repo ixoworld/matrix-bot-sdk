@@ -24,7 +24,7 @@ import { OpenIDConnectToken } from "./models/OpenIDConnect";
 import { doHttpRequest } from "./http";
 import { Space, SpaceCreateOptions } from "./models/Spaces";
 import { PowerLevelAction } from "./models/PowerLevelAction";
-import { CryptoClient } from "./e2ee/CryptoClient";
+import { CryptoClient, CryptoClientConfig } from "./e2ee/CryptoClient";
 import {
     FallbackKey,
     IToDeviceMessage,
@@ -110,12 +110,15 @@ export class MatrixClient extends EventEmitter {
      * @param {IStorageProvider} storage The storage provider to use. Defaults to MemoryStorageProvider.
      * @param {ICryptoStorageProvider} cryptoStore Optional crypto storage provider to use. If not supplied,
      * end-to-end encryption will not be functional in this client.
+     * @param {CryptoClientConfig} cryptoConfig Optional configuration for the crypto client, including
+     * recovery key for key backup.
      */
     constructor(
         public readonly homeserverUrl: string,
         public readonly accessToken: string,
         private storage: IStorageProvider = null,
         public readonly cryptoStore: ICryptoStorageProvider = null,
+        private readonly cryptoConfig: CryptoClientConfig = {},
     ) {
         super();
 
@@ -130,7 +133,7 @@ export class MatrixClient extends EventEmitter {
             if (!(this.cryptoStore instanceof RustSdkCryptoStorageProvider)) {
                 throw new Error("Cannot support custom encryption stores: Use a RustSdkCryptoStorageProvider");
             }
-            this.crypto = new CryptoClient(this);
+            this.crypto = new CryptoClient(this, this.cryptoConfig);
             this.on("room.event", (roomId, event) => {
                 // noinspection JSIgnoredPromiseFromCall
                 this.crypto.onRoomEvent(roomId, event);

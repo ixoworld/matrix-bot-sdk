@@ -9,14 +9,17 @@ import {
     HistoryVisibility,
     KeysUploadRequest,
     KeysQueryRequest,
+    KeysBackupRequest,
+    SignatureUploadRequest,
     ToDeviceRequest,
-} from "@matrix-org/matrix-sdk-crypto-nodejs";
+} from "@ixo/matrix-sdk-crypto-nodejs";
 import * as AsyncLock from "async-lock";
 
 import { MatrixClient } from "../MatrixClient";
 import { ICryptoRoomInformation } from "./ICryptoRoomInformation";
 import { EncryptionAlgorithm } from "../models/Crypto";
 import { EncryptionEvent } from "../models/events/EncryptionEvent";
+import { BackupManager } from "./BackupManager";
 
 /**
  * @internal
@@ -28,8 +31,16 @@ export const SYNC_LOCK_NAME = "sync";
  */
 export class RustEngine {
     public readonly lock = new AsyncLock();
+    public backupManager: BackupManager | null = null;
 
     public constructor(public readonly machine: OlmMachine, private client: MatrixClient) {
+    }
+
+    /**
+     * Set the backup manager for handling key backup requests.
+     */
+    public setBackupManager(manager: BackupManager): void {
+        this.backupManager = manager;
     }
 
     public async run() {
@@ -57,9 +68,11 @@ export class RustEngine {
                 case RequestType.RoomMessage:
                     throw new Error("Bindings error: Sending room messages is not supported");
                 case RequestType.SignatureUpload:
-                    throw new Error("Bindings error: Backup feature not possible");
+                    await this.processSignatureUploadRequest(request as SignatureUploadRequest);
+                    break;
                 case RequestType.KeysBackup:
-                    throw new Error("Bindings error: Backup feature not possible");
+                    await this.processKeysBackupRequest(request as KeysBackupRequest);
+                    break;
                 default:
                     throw new Error("Bindings error: Unrecognized request type: " + request.type);
             }
@@ -153,5 +166,34 @@ export class RustEngine {
     private async actuallyProcessToDeviceRequest(id: string, type: string, messages: Record<string, Record<string, unknown>>) {
         const resp = await this.client.sendToDevices(type, messages);
         await this.machine.markRequestAsSent(id, RequestType.ToDevice, JSON.stringify(resp));
+    }
+
+    private async processSignatureUploadRequest(request: SignatureUploadRequest) {
+        const resp = await this.client.doRequest(
+            "POST",
+            "/_matrix/client/v3/keys/signatures/upload",
+            null,
+            JSON.parse(request.body),
+        );
+        await this.machine.markRequestAsSent(request.id, request.type, JSON.stringify(resp));
+    }
+
+    private async processKeysBackupRequest(request: KeysBackupRequest) {
+        // Only process if we have an active backup version
+        const version = this.backupManager ? await this.backupManager.getActiveBackupVersion() : null;
+        if (!version) {
+            // No active backup, skip this request
+            // Mark as sent with empty response so it doesn't get retried
+            await this.machine.markRequestAsSent(request.id, request.type, "{}");
+            return;
+        }
+
+        const resp = await this.client.doRequest(
+            "PUT",
+            "/_matrix/client/v3/room_keys/keys",
+            { version },
+            JSON.parse(request.body),
+        );
+        await this.machine.markRequestAsSent(request.id, request.type, JSON.stringify(resp));
     }
 }

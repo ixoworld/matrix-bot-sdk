@@ -8,6 +8,7 @@ export * from "./appservice/UnstableAppserviceApis";
 // Encryption
 export * from "./e2ee/RoomTracker";
 export * from "./e2ee/CryptoClient";
+export * from "./e2ee/BackupManager";
 export * from "./e2ee/decorators";
 // export * from "./e2ee/RustEngine";
 export * from "./e2ee/ICryptoRoomInformation";
