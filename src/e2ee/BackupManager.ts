@@ -5,9 +5,14 @@ import {
     RequestType,
     RoomKeyImportResult,
 } from "@ixo/matrix-sdk-crypto-nodejs";
+import bs58 from "bs58";
 
 import { MatrixClient } from "../MatrixClient";
 import { LogService } from "../logging/LogService";
+
+// Constants for Base58 recovery key decoding
+const OLM_RECOVERY_KEY_PREFIX = [0x8b, 0x01];
+const KEY_SIZE = 32;
 
 /**
  * Structure of an exported room key that can be imported into the OlmMachine.
@@ -83,18 +88,81 @@ export class BackupManager {
     private backupLoopRunning = false;
     private stopped = false;
     private decryptionKey: BackupDecryptionKey | null = null;
+    private readonly recoveryKeyBase64?: string;
 
     /**
      * Creates a new BackupManager.
      * @param machine The OlmMachine instance for crypto operations
      * @param client The MatrixClient for API requests
-     * @param recoveryKey Optional base64-encoded recovery key for backup decryption
+     * @param recoveryKey Optional recovery key for backup decryption.
+     *   Supports both formats:
+     *   - Base58 (human-readable): "EsTc LW2K PGiF wKEA 3As5 g5c4 BXwk qeeJ ZJV8 Q9fu gUMN UE4d"
+     *   - Base64 (internal): "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo="
      */
     public constructor(
         private readonly machine: OlmMachine,
         private readonly client: MatrixClient,
-        private readonly recoveryKey?: string,
-    ) {}
+        recoveryKey?: string,
+    ) {
+        // Automatically decode recovery key if provided
+        if (recoveryKey) {
+            try {
+                this.recoveryKeyBase64 = BackupManager.decodeRecoveryKey(recoveryKey);
+            } catch (e) {
+                LogService.error("BackupManager", "Failed to decode recovery key:", e);
+            }
+        }
+    }
+
+    /**
+     * Decode a recovery key from Base58 format to Base64.
+     * Handles both Base58 (with spaces) and Base64 formats.
+     *
+     * Base58 format: "EsTc LW2K PGiF wKEA 3As5 g5c4 BXwk qeeJ ZJV8 Q9fu gUMN UE4d"
+     * Base64 format: "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo="
+     *
+     * @param recoveryKey The recovery key in either format
+     * @returns The recovery key in Base64 format
+     */
+    public static decodeRecoveryKey(recoveryKey: string): string {
+        // Check if it looks like Base58 (contains spaces or matches Base58 pattern)
+        const hasSpaces = recoveryKey.includes(" ");
+        const looksLikeBase64 = recoveryKey.includes("=") || recoveryKey.includes("+") || recoveryKey.includes("/");
+
+        if (!hasSpaces && looksLikeBase64) {
+            // Already Base64, return as-is
+            return recoveryKey;
+        }
+
+        // Decode from Base58
+        const stripped = recoveryKey.replace(/ /g, "");
+        const result = Array.from(bs58.decode(stripped));
+
+        // Verify parity
+        let parity = 0;
+        for (const b of result) {
+            parity ^= b;
+        }
+        if (parity !== 0) {
+            throw new Error("Invalid recovery key: incorrect parity");
+        }
+
+        // Verify prefix
+        for (let i = 0; i < OLM_RECOVERY_KEY_PREFIX.length; i++) {
+            if (result[i] !== OLM_RECOVERY_KEY_PREFIX[i]) {
+                throw new Error("Invalid recovery key: incorrect prefix");
+            }
+        }
+
+        // Verify length
+        if (result.length !== OLM_RECOVERY_KEY_PREFIX.length + KEY_SIZE + 1) {
+            throw new Error("Invalid recovery key: incorrect length");
+        }
+
+        // Extract the key and convert to Base64
+        const keyBytes = result.slice(OLM_RECOVERY_KEY_PREFIX.length, OLM_RECOVERY_KEY_PREFIX.length + KEY_SIZE);
+        return Buffer.from(keyBytes).toString("base64");
+    }
 
     /**
      * Stop the backup manager and cancel any pending operations.
@@ -141,7 +209,7 @@ export class BackupManager {
             }
 
             // If we have a recovery key, create a new backup
-            if (this.recoveryKey) {
+            if (this.recoveryKeyBase64) {
                 LogService.info("BackupManager", "No backup on server, creating new backup with configured recovery key");
                 try {
                     backupInfo = await this.createBackupVersion();
@@ -197,9 +265,9 @@ export class BackupManager {
 
         // Check if we have a matching decryption key
         let matchesDecryptionKey = false;
-        if (this.recoveryKey) {
+        if (this.recoveryKeyBase64) {
             try {
-                const decryptionKey = BackupDecryptionKey.fromBase64(this.recoveryKey);
+                const decryptionKey = BackupDecryptionKey.fromBase64(this.recoveryKeyBase64);
                 const publicKey = decryptionKey.megolmV1PublicKey.publicKeyBase64;
                 matchesDecryptionKey = publicKey === info.auth_data.public_key;
                 if (matchesDecryptionKey) {
@@ -250,12 +318,12 @@ export class BackupManager {
      * Create a new backup version on the server using the configured recovery key.
      */
     private async createBackupVersion(): Promise<KeyBackupInfo> {
-        if (!this.recoveryKey) {
+        if (!this.recoveryKeyBase64) {
             throw new Error("No recovery key configured");
         }
 
         // Derive public key from recovery key
-        const decryptionKey = BackupDecryptionKey.fromBase64(this.recoveryKey);
+        const decryptionKey = BackupDecryptionKey.fromBase64(this.recoveryKeyBase64);
         const publicKey = decryptionKey.megolmV1PublicKey.publicKeyBase64;
 
         // Create backup on server
