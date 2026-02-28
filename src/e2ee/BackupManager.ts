@@ -125,13 +125,20 @@ export class BackupManager {
      * @returns The recovery key in Base64 format
      */
     public static decodeRecoveryKey(recoveryKey: string): string {
-        // Check if it looks like Base58 (contains spaces or matches Base58 pattern)
-        const hasSpaces = recoveryKey.includes(" ");
-        const looksLikeBase64 = recoveryKey.includes("=") || recoveryKey.includes("+") || recoveryKey.includes("/");
-
-        if (!hasSpaces && looksLikeBase64) {
-            // Already Base64, return as-is
-            return recoveryKey;
+        // Try Base64 first: if it decodes to exactly 32 bytes, it's a raw backup key
+        if (!recoveryKey.includes(" ")) {
+            try {
+                const decoded = Buffer.from(recoveryKey, "base64");
+                if (decoded.length === KEY_SIZE) {
+                    // Verify it's actually base64 and not just coincidence by re-encoding
+                    const reencoded = decoded.toString("base64");
+                    if (reencoded === recoveryKey || reencoded.replace(/=+$/, "") === recoveryKey.replace(/=+$/, "")) {
+                        return recoveryKey;
+                    }
+                }
+            } catch {
+                // Not valid base64, fall through to Base58
+            }
         }
 
         // Decode from Base58
