@@ -175,6 +175,12 @@ export interface IAppserviceOptions {
     cryptoStorage?: IAppserviceCryptoStorageProvider;
 
     /**
+     * Optional configuration for the crypto client. If provided with a recoveryKey,
+     * enables automatic key backup and recovery for the bot intent's encryption.
+     */
+    cryptoConfig?: import("../e2ee/CryptoClient").CryptoClientConfig;
+
+    /**
      * The registration for this application service.
      */
     registration: IAppserviceRegistration;
