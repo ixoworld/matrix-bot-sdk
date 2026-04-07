@@ -646,6 +646,12 @@ export class Appservice extends EventEmitter {
         const targetMembership = event["content"]["membership"];
         if (targetMembership === "join") {
             this.emit("room.join", event["room_id"], event);
+            const hasCrypto = !!intent.underlyingClient.crypto;
+            const cryptoReady = intent.underlyingClient.crypto?.isReady;
+            LogService.info("Appservice", `processMembershipEvent join: user=${intent.userId} room=${event["room_id"]} hasCrypto=${hasCrypto} cryptoReady=${cryptoReady}`);
+            if (this.cryptoStorage) {
+                await intent.enableEncryption();
+            }
             await intent.underlyingClient.crypto?.onRoomJoin(event["room_id"]);
         } else if (targetMembership === "ban" || targetMembership === "leave") {
             this.emit("room.leave", event["room_id"], event);
@@ -864,6 +870,7 @@ export class Appservice extends EventEmitter {
 
                                 if (tryUserId) {
                                     const intent = this.getIntentForUserId(tryUserId);
+                                    await intent.enableEncryption();
 
                                     event = (await intent.underlyingClient.crypto.decryptRoomEvent(encrypted, roomId)).raw;
                                     event = await this.processEvent(event);

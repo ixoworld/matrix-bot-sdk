@@ -89,6 +89,8 @@ export class BackupManager {
     private stopped = false;
     private decryptionKey: BackupDecryptionKey | null = null;
     private readonly recoveryKeyBase64?: string;
+    /** In Memory Cache of session IDs confirmed missing from backup — avoids repeated HTTP lookups */
+    private readonly missingSessionCache = new Set<string>();
 
     /**
      * Creates a new BackupManager.
@@ -300,6 +302,7 @@ export class BackupManager {
             backupInfo.version,
         );
         this.activeBackupVersion = backupInfo.version;
+        this.missingSessionCache.clear();
 
         // Save the decryption key if we have it
         if (this.decryptionKey) {
@@ -630,12 +633,19 @@ export class BackupManager {
             return false;
         }
 
+        const cacheKey = `${roomId}:${sessionId}`;
+        if (this.missingSessionCache.has(cacheKey)) {
+            LogService.debug("BackupManager", `Session ${sessionId} already known missing from backup, skipping`);
+            return false;
+        }
+
         LogService.info("BackupManager", `Fetching key for room ${roomId} session ${sessionId} from backup v${version}`);
 
         try {
             const sessionData = await this.downloadSessionKey(version, roomId, sessionId);
             if (!sessionData) {
                 LogService.warn("BackupManager", `Key not found in backup for session ${sessionId}`);
+                this.missingSessionCache.add(cacheKey);
                 return false;
             }
 
