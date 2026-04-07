@@ -115,7 +115,9 @@ export class CryptoClient {
             this.storage.storageType,
         );
         this.engine = new RustEngine(machine, this.client);
+        LogService.info("CryptoClient", `OlmMachine initialized, running initial outgoing requests`);
         await this.engine.run();
+        LogService.info("CryptoClient", `Initial outgoing requests complete`);
 
         const identity = this.engine.machine.identityKeys;
         this.deviceCurve25519 = identity.curve25519.toBase64();

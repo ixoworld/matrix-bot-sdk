@@ -20,6 +20,7 @@ import { ICryptoRoomInformation } from "./ICryptoRoomInformation";
 import { EncryptionAlgorithm } from "../models/Crypto";
 import { EncryptionEvent } from "../models/events/EncryptionEvent";
 import { BackupManager } from "./BackupManager";
+import { LogService } from "../logging/LogService";
 
 /**
  * @internal
@@ -50,6 +51,9 @@ export class RustEngine {
     private async runOnly(...types: RequestType[]) {
         // Note: we should not be running this until it runs out, so cache the value into a variable
         const requests = await this.machine.outgoingRequests();
+        if (requests.length > 0) {
+            LogService.debug("RustEngine", `Processing ${requests.length} outgoing request(s)`);
+        }
         for (const request of requests) {
             if (types.length && !types.includes(request.type)) continue;
             switch (request.type) {
@@ -149,7 +153,13 @@ export class RustEngine {
     private async processKeysUploadRequest(request: KeysUploadRequest) {
         const body = JSON.parse(request.body);
         // delete body["one_time_keys"]; // use this to test MSC3983
+        const otkIds = body.one_time_keys ? Object.keys(body.one_time_keys) : [];
+        if (otkIds.length > 0) {
+            LogService.info("RustEngine", `Uploading ${otkIds.length} OTK(s): [${otkIds.join(", ")}]`);
+        }
         const resp = await this.client.doRequest("POST", "/_matrix/client/v3/keys/upload", null, body);
+        const counts = resp?.one_time_key_counts?.signed_curve25519 ?? "unknown";
+        LogService.debug("RustEngine", `Keys upload response: server OTK count = ${counts}`);
         await this.machine.markRequestAsSent(request.id, request.type, JSON.stringify(resp));
     }
 
