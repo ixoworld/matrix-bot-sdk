@@ -1,6 +1,6 @@
 {
   "name": "@ixo/matrix-bot-sdk",
-  "version": "0.8.0-ixo.9",
+  "version": "0.8.0-ixo.10",
   "description": "TypeScript/JavaScript SDK for Matrix bots and appservices (ixo fork)",
   "repository": {
     "type": "git",
