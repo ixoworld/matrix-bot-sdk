@@ -132,6 +132,7 @@ export class CryptoClient {
                 this.engine.machine,
                 this.client,
                 this.config.recoveryKey,
+                this.engine.lock,
             );
             this.engine.setBackupManager(this.backupManager);
 
@@ -302,9 +303,11 @@ export class CryptoClient {
 
         await this.engine.prepareEncrypt(roomId, await this.roomTracker.getRoomCryptoConfig(roomId));
 
-        const encrypted = JSON.parse(await this.engine.machine.encryptRoomEvent(new RoomId(roomId), eventType, JSON.stringify(content)));
-        await this.engine.run();
-        return encrypted as IMegolmEncrypted;
+        return await this.engine.lock.acquire(SYNC_LOCK_NAME, async () => {
+            const encrypted = JSON.parse(await this.engine.machine.encryptRoomEvent(new RoomId(roomId), eventType, JSON.stringify(content)));
+            await this.engine.run();
+            return encrypted as IMegolmEncrypted;
+        });
     }
 
     /**

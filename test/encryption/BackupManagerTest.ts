@@ -1,8 +1,11 @@
 import HttpBackend from "matrix-mock-request";
+import * as AsyncLock from "async-lock";
 import { BackupDecryptionKey } from "@ixo/matrix-sdk-crypto-nodejs";
 
 import { MatrixClient, setRequestFn } from "../../src";
 import { BackupManager, KeyBackupInfo, KeyBackupSessionData } from "../../src/e2ee/BackupManager";
+
+const testLock = new AsyncLock();
 
 // Test fixtures from matrix-js-sdk - cryptographically valid and interoperable
 // These are generated test data that can actually be decrypted
@@ -86,7 +89,7 @@ describe("BackupManager", () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
 
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             // Server returns 404 - no backup
             http.when("GET", "/_matrix/client/v3/room_keys/version").respond(404, {
@@ -106,7 +109,7 @@ describe("BackupManager", () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
 
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             http.when("GET", "/_matrix/client/v3/room_keys/version").respond(200, SIGNED_BACKUP_DATA);
 
@@ -133,7 +136,7 @@ describe("BackupManager", () => {
 
             // Use a different (random) recovery key that won't match the backup's public key
             const differentKey = BackupDecryptionKey.createRandomKey();
-            const manager = new BackupManager(mockMachine as any, client, differentKey.toBase64());
+            const manager = new BackupManager(mockMachine as any, client, differentKey.toBase64(), testLock);
 
             http.when("GET", "/_matrix/client/v3/room_keys/version").respond(200, SIGNED_BACKUP_DATA);
 
@@ -154,7 +157,7 @@ describe("BackupManager", () => {
             mockMachine.verifyBackup = jest.fn().mockResolvedValue({ trusted: () => true });
 
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client); // No recovery key
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock); // No recovery key
 
             http.when("GET", "/_matrix/client/v3/room_keys/version").respond(200, SIGNED_BACKUP_DATA);
 
@@ -176,7 +179,7 @@ describe("BackupManager", () => {
             mockMachine.isBackupEnabled = jest.fn().mockResolvedValue(true);
 
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
             // Manually set active version to simulate enabled state
             (manager as any).activeBackupVersion = "1";
 
@@ -206,7 +209,7 @@ describe("BackupManager", () => {
             });
 
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             // Set up manager state - simulate backup already enabled
             (manager as any).activeBackupVersion = "1";
@@ -250,7 +253,7 @@ describe("BackupManager", () => {
             });
 
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             (manager as any).activeBackupVersion = "1";
             (manager as any).decryptionKey = BackupDecryptionKey.fromBase64(BACKUP_DECRYPTION_KEY_BASE64);
@@ -280,7 +283,7 @@ describe("BackupManager", () => {
         it("should throw when no recovery key is configured", async () => {
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client); // No recovery key
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock); // No recovery key
 
             (manager as any).activeBackupVersion = "1";
 
@@ -292,7 +295,7 @@ describe("BackupManager", () => {
         it("should throw when no backup version specified and no active backup", async () => {
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             // No active backup version set
             await expect(manager.restoreKeyBackup()).rejects.toThrow(
@@ -303,7 +306,7 @@ describe("BackupManager", () => {
         it("should handle empty backup gracefully", async () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             (manager as any).activeBackupVersion = "1";
             (manager as any).decryptionKey = BackupDecryptionKey.fromBase64(BACKUP_DECRYPTION_KEY_BASE64);
@@ -333,7 +336,7 @@ describe("BackupManager", () => {
             });
 
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             (manager as any).activeBackupVersion = "1";
             (manager as any).decryptionKey = BackupDecryptionKey.fromBase64(BACKUP_DECRYPTION_KEY_BASE64);
@@ -362,7 +365,7 @@ describe("BackupManager", () => {
         it("should return false when key not found in backup", async () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             (manager as any).activeBackupVersion = "1";
             (manager as any).decryptionKey = BackupDecryptionKey.fromBase64(BACKUP_DECRYPTION_KEY_BASE64);
@@ -386,7 +389,7 @@ describe("BackupManager", () => {
         it("should return false when backup not enabled", async () => {
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             // No active backup version
             const result = await manager.importSessionKeyFromBackup("!room:example.org", "session");
@@ -397,7 +400,7 @@ describe("BackupManager", () => {
         it("should return false when no decryption key available", async () => {
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client); // No recovery key
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock); // No recovery key
 
             (manager as any).activeBackupVersion = "1";
             // No decryption key
@@ -417,7 +420,7 @@ describe("BackupManager", () => {
             });
 
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             (manager as any).activeBackupVersion = "1";
             (manager as any).decryptionKey = BackupDecryptionKey.fromBase64(BACKUP_DECRYPTION_KEY_BASE64);
@@ -442,7 +445,7 @@ describe("BackupManager", () => {
         it("should return matchesDecryptionKey true when recovery key matches", async () => {
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             const result = await manager.isKeyBackupTrusted(SIGNED_BACKUP_DATA);
 
@@ -453,7 +456,7 @@ describe("BackupManager", () => {
             const differentKey = BackupDecryptionKey.createRandomKey();
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, differentKey.toBase64());
+            const manager = new BackupManager(mockMachine as any, client, differentKey.toBase64(), testLock);
 
             const result = await manager.isKeyBackupTrusted(SIGNED_BACKUP_DATA);
 
@@ -465,7 +468,7 @@ describe("BackupManager", () => {
             mockMachine.verifyBackup = jest.fn().mockResolvedValue({ trusted: () => true });
 
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             const result = await manager.isKeyBackupTrusted(SIGNED_BACKUP_DATA);
 
@@ -478,7 +481,7 @@ describe("BackupManager", () => {
         it("should decrypt session data with correct key", () => {
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64);
+            const manager = new BackupManager(mockMachine as any, client, BACKUP_DECRYPTION_KEY_BASE64, testLock);
 
             // Set decryption key
             (manager as any).decryptionKey = BackupDecryptionKey.fromBase64(BACKUP_DECRYPTION_KEY_BASE64);
@@ -493,7 +496,7 @@ describe("BackupManager", () => {
         it("should throw when no decryption key available", () => {
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             // No decryption key
             expect(() => manager.decryptSession(CURVE25519_KEY_BACKUP_DATA)).toThrow(
@@ -506,7 +509,7 @@ describe("BackupManager", () => {
         it("should return session data for existing key", async () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             const roomId = "!room:id";
             const sessionId = MEGOLM_SESSION_DATA.session_id;
@@ -528,7 +531,7 @@ describe("BackupManager", () => {
         it("should return null when key not found", async () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             const roomId = "!room:example.org";
             const sessionId = "nonexistent";
@@ -550,7 +553,7 @@ describe("BackupManager", () => {
         it("should stop the backup loop", async () => {
             const mockMachine = createMockMachine();
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             manager.stop();
 
@@ -564,7 +567,7 @@ describe("BackupManager", () => {
             mockMachine.roomKeyCounts = jest.fn().mockResolvedValue({ total: 10, backedUp: 5 });
 
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             const counts = await manager.getRoomKeyCounts();
 
@@ -579,7 +582,7 @@ describe("BackupManager", () => {
             mockMachine.isBackupEnabled = jest.fn().mockResolvedValue(true);
 
             const { client } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             const enabled = await manager.isBackupEnabled();
 
@@ -591,7 +594,7 @@ describe("BackupManager", () => {
         it("should fetch backup version from server", async () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             http.when("GET", "/_matrix/client/v3/room_keys/version").respond(200, SIGNED_BACKUP_DATA);
 
@@ -607,7 +610,7 @@ describe("BackupManager", () => {
         it("should fetch specific backup version", async () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             http.when("GET", "/_matrix/client/v3/room_keys/version/2").respond(200, {
                 ...SIGNED_BACKUP_DATA,
@@ -625,7 +628,7 @@ describe("BackupManager", () => {
         it("should return null when no backup exists", async () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             http.when("GET", "/_matrix/client/v3/room_keys/version").respond(404, {
                 errcode: "M_NOT_FOUND",
@@ -644,7 +647,7 @@ describe("BackupManager", () => {
         it("should download all backed up keys", async () => {
             const mockMachine = createMockMachine();
             const { client, http } = createMockClient();
-            const manager = new BackupManager(mockMachine as any, client);
+            const manager = new BackupManager(mockMachine as any, client, undefined, testLock);
 
             const backupData = {
                 rooms: {

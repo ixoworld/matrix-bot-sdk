@@ -7,8 +7,11 @@ import {
 } from "@ixo/matrix-sdk-crypto-nodejs";
 import bs58 from "bs58";
 
+import * as AsyncLock from "async-lock";
+
 import { MatrixClient } from "../MatrixClient";
 import { LogService } from "../logging/LogService";
+import { SYNC_LOCK_NAME } from "./RustEngine";
 
 // Constants for Base58 recovery key decoding
 const OLM_RECOVERY_KEY_PREFIX = [0x8b, 0x01];
@@ -104,7 +107,8 @@ export class BackupManager {
     public constructor(
         private readonly machine: OlmMachine,
         private readonly client: MatrixClient,
-        recoveryKey?: string,
+        recoveryKey: string | undefined,
+        private readonly lock: AsyncLock,
     ) {
         // Automatically decode recovery key if provided
         if (recoveryKey) {
@@ -392,10 +396,12 @@ export class BackupManager {
             let keysUploaded = 0;
 
             while (!this.stopped) {
-                // Get a batch of room keys to upload
+                // Get a batch of room keys to upload (lock protects SQLite access)
                 let request: KeysBackupRequest | null = null;
                 try {
-                    request = await this.machine.backupRoomKeys();
+                    request = await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+                        return await this.machine.backupRoomKeys();
+                    });
                 } catch (err) {
                     LogService.error("BackupManager", "Failed to get keys for backup:", err);
                 }
@@ -414,7 +420,7 @@ export class BackupManager {
                 }
 
                 try {
-                    // Upload the keys to the server
+                    // Upload the keys to the server (HTTP — no lock needed)
                     const response = await this.client.doRequest(
                         "PUT",
                         `/_matrix/client/v3/room_keys/keys`,
@@ -422,8 +428,10 @@ export class BackupManager {
                         JSON.parse(request.body),
                     );
 
-                    // Mark the request as sent - must pass the actual server response with etag
-                    await this.machine.markRequestAsSent(request.id, RequestType.KeysBackup, JSON.stringify(response));
+                    // Mark the request as sent (lock protects SQLite access)
+                    await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+                        await this.machine.markRequestAsSent(request.id, RequestType.KeysBackup, JSON.stringify(response));
+                    });
                     keysUploaded++;
                     numFailures = 0;
 
@@ -663,11 +671,13 @@ export class BackupManager {
                 forwarding_curve25519_key_chain: decryptedSession.forwarding_curve25519_key_chain as string[] || [],
             };
 
-            // Import the key
-            const importResult = await this.machine.importRoomKeys(
-                JSON.stringify([exportedKey]),
-                version, // fromBackupVersion = backup version string
-            );
+            // Import the key (lock protects SQLite access)
+            const importResult = await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+                return await this.machine.importRoomKeys(
+                    JSON.stringify([exportedKey]),
+                    version, // fromBackupVersion = backup version string
+                );
+            });
 
             const success = importResult.importedCount > 0;
             if (success) {
