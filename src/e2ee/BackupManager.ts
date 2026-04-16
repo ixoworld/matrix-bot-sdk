@@ -399,7 +399,9 @@ export class BackupManager {
                 // Get a batch of room keys to upload (lock protects SQLite access)
                 let request: KeysBackupRequest | null = null;
                 try {
+                    LogService.debug("BackupManager", "backupKeysLoop: waiting for sync lock (backupRoomKeys)");
                     request = await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+                        LogService.debug("BackupManager", "backupKeysLoop: sync lock acquired (backupRoomKeys)");
                         return await this.machine.backupRoomKeys();
                     });
                 } catch (err) {
@@ -429,7 +431,9 @@ export class BackupManager {
                     );
 
                     // Mark the request as sent (lock protects SQLite access)
+                    LogService.debug("BackupManager", "backupKeysLoop: waiting for sync lock (markRequestAsSent)");
                     await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+                        LogService.debug("BackupManager", "backupKeysLoop: sync lock acquired (markRequestAsSent)");
                         await this.machine.markRequestAsSent(request.id, RequestType.KeysBackup, JSON.stringify(response));
                     });
                     keysUploaded++;
@@ -672,7 +676,9 @@ export class BackupManager {
             };
 
             // Import the key (lock protects SQLite access)
+            LogService.debug("BackupManager", "importSessionKey: waiting for sync lock");
             const importResult = await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+                LogService.debug("BackupManager", "importSessionKey: sync lock acquired");
                 return await this.machine.importRoomKeys(
                     JSON.stringify([exportedKey]),
                     version, // fromBackupVersion = backup version string

@@ -237,7 +237,9 @@ export class CryptoClient {
             changedDeviceLists.map(u => new UserId(u)),
             leftDeviceLists.map(u => new UserId(u)));
 
+        LogService.debug("CryptoClient", "updateSyncData: waiting for sync lock");
         await this.engine.lock.acquire(SYNC_LOCK_NAME, async () => {
+            LogService.debug("CryptoClient", "updateSyncData: sync lock acquired");
             const syncResp = await this.engine.machine.receiveSyncChanges(deviceMessages, deviceLists, otkCounts, unusedFallbackKeyAlgs);
             const decryptedToDeviceMessages = JSON.parse(syncResp);
             if (Array.isArray(decryptedToDeviceMessages)) {
@@ -252,6 +254,7 @@ export class CryptoClient {
             if (this.backupManager) {
                 await this.backupManager.maybeUploadKey();
             }
+            LogService.debug("CryptoClient", "updateSyncData: releasing sync lock");
         });
     }
 
@@ -303,9 +306,12 @@ export class CryptoClient {
 
         await this.engine.prepareEncrypt(roomId, await this.roomTracker.getRoomCryptoConfig(roomId));
 
+        LogService.debug("CryptoClient", "encryptRoomEvent: waiting for sync lock");
         return await this.engine.lock.acquire(SYNC_LOCK_NAME, async () => {
+            LogService.debug("CryptoClient", "encryptRoomEvent: sync lock acquired");
             const encrypted = JSON.parse(await this.engine.machine.encryptRoomEvent(new RoomId(roomId), eventType, JSON.stringify(content)));
             await this.engine.run();
+            LogService.debug("CryptoClient", "encryptRoomEvent: releasing sync lock");
             return encrypted as IMegolmEncrypted;
         });
     }
