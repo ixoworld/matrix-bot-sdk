@@ -84,7 +84,9 @@ export class RustEngine {
     }
 
     public async addTrackedUsers(userIds: string[]) {
+        LogService.debug("RustEngine", `addTrackedUsers: waiting for sync lock (${userIds.length} users)`);
         await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+            LogService.debug("RustEngine", "addTrackedUsers: sync lock acquired");
             const uids = userIds.map(u => new UserId(u));
             await this.machine.updateTrackedUsers(uids);
 
@@ -92,6 +94,7 @@ export class RustEngine {
             if (keysClaim) {
                 await this.processKeysClaimRequest(keysClaim);
             }
+            LogService.debug("RustEngine", "addTrackedUsers: releasing sync lock");
         });
     }
 
@@ -128,13 +131,16 @@ export class RustEngine {
         settings.rotationPeriod = BigInt(encEv.rotationPeriodMs);
         settings.rotationPeriodMessages = BigInt(encEv.rotationPeriodMessages);
 
+        LogService.debug("RustEngine", "prepareEncrypt: waiting for sync lock");
         await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+            LogService.debug("RustEngine", "prepareEncrypt: sync lock acquired");
             await this.machine.updateTrackedUsers(members); // just in case we missed some
             await this.runOnly(RequestType.KeysQuery);
             const keysClaim = await this.machine.getMissingSessions(members);
             if (keysClaim) {
                 await this.processKeysClaimRequest(keysClaim);
             }
+            LogService.debug("RustEngine", "prepareEncrypt: releasing sync lock");
         });
 
         await this.lock.acquire(roomId, async () => {
