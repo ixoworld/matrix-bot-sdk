@@ -646,9 +646,6 @@ export class Appservice extends EventEmitter {
         const targetMembership = event["content"]["membership"];
         if (targetMembership === "join") {
             this.emit("room.join", event["room_id"], event);
-            const hasCrypto = !!intent.underlyingClient.crypto;
-            const cryptoReady = intent.underlyingClient.crypto?.isReady;
-            LogService.info("Appservice", `processMembershipEvent join: user=${intent.userId} room=${event["room_id"]} hasCrypto=${hasCrypto} cryptoReady=${cryptoReady}`);
             if (this.cryptoStorage) {
                 await intent.enableEncryption();
             }

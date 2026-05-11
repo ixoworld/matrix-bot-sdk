@@ -51,9 +51,6 @@ export class RustEngine {
     private async runOnly(...types: RequestType[]) {
         // Note: we should not be running this until it runs out, so cache the value into a variable
         const requests = await this.machine.outgoingRequests();
-        if (requests.length > 0) {
-            LogService.debug("RustEngine", `Processing ${requests.length} outgoing request(s)`);
-        }
         for (const request of requests) {
             if (types.length && !types.includes(request.type)) continue;
             switch (request.type) {
@@ -84,9 +81,7 @@ export class RustEngine {
     }
 
     public async addTrackedUsers(userIds: string[]) {
-        LogService.debug("RustEngine", `addTrackedUsers: waiting for sync lock (${userIds.length} users)`);
         await this.lock.acquire(SYNC_LOCK_NAME, async () => {
-            LogService.debug("RustEngine", "addTrackedUsers: sync lock acquired");
             const uids = userIds.map(u => new UserId(u));
             await this.machine.updateTrackedUsers(uids);
 
@@ -94,7 +89,6 @@ export class RustEngine {
             if (keysClaim) {
                 await this.processKeysClaimRequest(keysClaim);
             }
-            LogService.debug("RustEngine", "addTrackedUsers: releasing sync lock");
         });
     }
 
@@ -131,16 +125,13 @@ export class RustEngine {
         settings.rotationPeriod = BigInt(encEv.rotationPeriodMs);
         settings.rotationPeriodMessages = BigInt(encEv.rotationPeriodMessages);
 
-        LogService.debug("RustEngine", "prepareEncrypt: waiting for sync lock");
         await this.lock.acquire(SYNC_LOCK_NAME, async () => {
-            LogService.debug("RustEngine", "prepareEncrypt: sync lock acquired");
             await this.machine.updateTrackedUsers(members); // just in case we missed some
             await this.runOnly(RequestType.KeysQuery);
             const keysClaim = await this.machine.getMissingSessions(members);
             if (keysClaim) {
                 await this.processKeysClaimRequest(keysClaim);
             }
-            LogService.debug("RustEngine", "prepareEncrypt: releasing sync lock");
         });
 
         await this.lock.acquire(roomId, async () => {
@@ -161,7 +152,9 @@ export class RustEngine {
         // delete body["one_time_keys"]; // use this to test MSC3983
         const otkIds = body.one_time_keys ? Object.keys(body.one_time_keys) : [];
         if (otkIds.length > 0) {
-            LogService.info("RustEngine", `Uploading ${otkIds.length} OTK(s): [${otkIds.join(", ")}]`);
+            // Kept at debug for diagnosing OTK conflicts (e.g. "One time key ... already exists"
+            // from Synapse) — enable LOG_LEVEL=DEBUG on a single pod to capture the colliding key ids.
+            LogService.debug("RustEngine", `Uploading ${otkIds.length} OTK(s): [${otkIds.join(", ")}]`);
         }
         const resp = await this.client.doRequest("POST", "/_matrix/client/v3/keys/upload", null, body);
         const counts = resp?.one_time_key_counts?.signed_curve25519 ?? "unknown";
