@@ -17,6 +17,10 @@
     "title": "Room upgrades",
     "order": 4
   },
+  "ntfy-alerts": {
+    "title": "Ntfy alerts bridge",
+    "order": 5
+  },
   "encryption": {
     "title": "Encryption",
     "order": 3,

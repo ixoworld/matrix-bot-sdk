@@ -99,6 +99,12 @@ export * from "./storage/SimplePostgresStorageProvider";
 export * from "./strategies/AppserviceJoinRoomStrategy";
 export * from "./strategies/JoinRoomStrategy";
 
+// Ntfy alerts
+export * from "./ntfy/INtfyMessage";
+export * from "./ntfy/NtfyClient";
+export * from "./ntfy/AlertCleanupService";
+export * from "./ntfy/NtfyMatrixBridge";
+
 // Other clients
 export * from "./identity/IdentityClient";
 
