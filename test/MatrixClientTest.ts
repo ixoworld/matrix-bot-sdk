@@ -6,6 +6,7 @@ import {
     EventKind,
     IJoinRoomStrategy,
     IPreprocessor,
+    IToDeviceMessage,
     MatrixClient,
     Membership,
     MemoryStorageProvider,
@@ -941,6 +942,63 @@ describe('MatrixClient', () => {
             });
 
             await Promise.all([client.inviteUser(userId, roomId), http.flushAllExpected()]);
+        });
+
+        it('should share room history before inviting when crypto is ready', async () => {
+            const { client, http } = createTestClient();
+
+            const roomId = "!abc123:example.org";
+            const userId = "@example:example.org";
+
+            const shareSpy = simple.stub().callFn((rid, uid) => {
+                expect(rid).toEqual(roomId);
+                expect(uid).toEqual(userId);
+                return Promise.resolve();
+            });
+            (<any>client).crypto = { isReady: true, shareRoomHistoryWithUser: shareSpy };
+
+            http.when("POST", "/_matrix/client/v3/rooms").respond(200, () => {
+                expect(shareSpy.callCount).toBe(1); // shared before the invite went out
+                return {};
+            });
+
+            await Promise.all([client.inviteUser(userId, roomId), http.flushAllExpected()]);
+            expect(shareSpy.callCount).toBe(1);
+        });
+
+        it('should still invite when history sharing fails', async () => {
+            const { client, http } = createTestClient();
+
+            const roomId = "!abc123:example.org";
+            const userId = "@example:example.org";
+
+            const shareSpy = simple.stub().callFn(() => Promise.reject(new Error("bundle failure")));
+            (<any>client).crypto = { isReady: true, shareRoomHistoryWithUser: shareSpy };
+
+            http.when("POST", "/_matrix/client/v3/rooms").respond(200, () => {
+                return {};
+            });
+
+            await Promise.all([client.inviteUser(userId, roomId), http.flushAllExpected()]);
+            expect(shareSpy.callCount).toBe(1);
+        });
+
+        it('should not share room history when disabled', async () => {
+            const { client, http } = createTestClient();
+
+            const roomId = "!abc123:example.org";
+            const userId = "@example:example.org";
+
+            const shareSpy = simple.stub().callFn(() => Promise.resolve());
+            (<any>client).crypto = { isReady: true, shareRoomHistoryWithUser: shareSpy };
+            client.shareRoomHistoryOnInvite = false;
+
+            http.when("POST", "/_matrix/client/v3/rooms").respond(200, () => {
+                return {};
+            });
+
+            await Promise.all([client.inviteUser(userId, roomId), http.flushAllExpected()]);
+            expect(shareSpy.callCount).toBe(0);
         });
     });
 
@@ -2323,6 +2381,23 @@ describe('MatrixClient', () => {
             await client.processSync(sync);
             expect(spy.callCount).toBe(1);
         }));
+
+        it('should process to-device messages regardless of crypto', async () => {
+            const { client: realClient } = createTestClient();
+            const client = <ProcessSyncClient>(<any>realClient);
+
+            const sync = {
+                to_device: { events: [{ type: "org.example", content: { hello: "world" } }] },
+            };
+
+            const spy = simple.stub().callFn((toDeviceMsg: IToDeviceMessage) => {
+                expect(toDeviceMsg).toMatchObject(sync.to_device.events[0]);
+            });
+            realClient.on("to-device", spy);
+
+            await client.processSync(sync);
+            expect(spy.callCount).toBe(1);
+        });
     });
 
     describe('getEvent', () => {
@@ -2870,6 +2945,81 @@ describe('MatrixClient', () => {
 
             const [result] = await Promise.all([client.joinRoom(roomId), http.flushAllExpected()]);
             expect(result).toEqual(roomId);
+        });
+
+        it('should look for a room key bundle when joining from a recorded invite', async () => {
+            const { client, http } = createTestClient();
+
+            const roomId = "!testing:example.org";
+            const inviter = "@inviter:example.org";
+
+            (<any>client).userId = "@joins:example.org"; // avoid /whoami lookup
+
+            const markSpy = simple.stub().callFn((rid, uid) => {
+                expect(rid).toEqual(roomId);
+                expect(uid).toEqual(inviter);
+                return Promise.resolve();
+            });
+            const acceptSpy = simple.stub().callFn((rid, uid) => {
+                expect(rid).toEqual(roomId);
+                expect(uid).toEqual(inviter);
+                return Promise.resolve(true);
+            });
+            (<any>client).crypto = { isReady: true, markRoomAsPendingKeyBundle: markSpy, maybeAcceptKeyBundle: acceptSpy };
+
+            client.recordInviteForKeyBundle(roomId, inviter);
+
+            // noinspection TypeScriptValidateJSTypes
+            http.when("POST", "/_matrix/client/v3/join").respond(200, () => {
+                return { room_id: roomId };
+            });
+
+            const [result] = await Promise.all([client.joinRoom(roomId), http.flushAllExpected()]);
+            expect(result).toEqual(roomId);
+            expect(markSpy.callCount).toBe(1);
+            expect(acceptSpy.callCount).toBe(1);
+        });
+
+        it('should not fail the join when key bundle processing fails', async () => {
+            const { client, http } = createTestClient();
+
+            const roomId = "!testing:example.org";
+
+            (<any>client).userId = "@joins:example.org"; // avoid /whoami lookup
+
+            const markSpy = simple.stub().callFn(() => Promise.reject(new Error("bundle failure")));
+            (<any>client).crypto = { isReady: true, markRoomAsPendingKeyBundle: markSpy, maybeAcceptKeyBundle: () => Promise.resolve(false) };
+
+            client.recordInviteForKeyBundle(roomId, "@inviter:example.org");
+
+            // noinspection TypeScriptValidateJSTypes
+            http.when("POST", "/_matrix/client/v3/join").respond(200, () => {
+                return { room_id: roomId };
+            });
+
+            const [result] = await Promise.all([client.joinRoom(roomId), http.flushAllExpected()]);
+            expect(result).toEqual(roomId);
+            expect(markSpy.callCount).toBe(1);
+        });
+
+        it('should not look for a room key bundle without a recorded invite', async () => {
+            const { client, http } = createTestClient();
+
+            const roomId = "!testing:example.org";
+
+            (<any>client).userId = "@joins:example.org"; // avoid /whoami lookup
+
+            const markSpy = simple.stub().callFn(() => Promise.resolve());
+            (<any>client).crypto = { isReady: true, markRoomAsPendingKeyBundle: markSpy, maybeAcceptKeyBundle: () => Promise.resolve(false) };
+
+            // noinspection TypeScriptValidateJSTypes
+            http.when("POST", "/_matrix/client/v3/join").respond(200, () => {
+                return { room_id: roomId };
+            });
+
+            const [result] = await Promise.all([client.joinRoom(roomId), http.flushAllExpected()]);
+            expect(result).toEqual(roomId);
+            expect(markSpy.callCount).toBe(0);
         });
 
         it('should call the right endpoint with server names', async () => {

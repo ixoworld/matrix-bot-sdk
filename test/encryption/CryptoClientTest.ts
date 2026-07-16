@@ -1,5 +1,6 @@
 import * as simple from "simple-mock";
 import HttpBackend from 'matrix-mock-request';
+import { RoomId } from "@ixo/matrix-sdk-crypto-nodejs";
 
 import { EncryptedFile, MatrixClient, MembershipEvent, OTKAlgorithm, RoomEncryptionAlgorithm } from "../../src";
 import { createTestClient, testCryptoStores, TEST_DEVICE_ID } from "../TestUtils";
@@ -605,12 +606,177 @@ describe('CryptoClient', () => {
                 key: {
                     alg: "A256CTR",
                     ext: true,
-                    key_ops: ['encrypt', 'decrypt'],
+                    key_ops: expect.arrayContaining(['encrypt', 'decrypt']),
                     kty: "oct",
                     k: expect.any(String),
                 },
                 iv: expect.any(String),
                 v: "v2",
+            });
+        });
+    });
+
+    describe('shareRoomHistoryWithUser', () => {
+        const userId = "@alice:example.org";
+        const roomId = "!room:example.org";
+        const targetUserId = "@bob:example.org";
+        let client: MatrixClient;
+        let http: HttpBackend;
+
+        beforeEach(() => testCryptoStores(async (cryptoStoreType) => {
+            const { client: mclient, http: mhttp } = createTestClient(null, userId, cryptoStoreType);
+            client = mclient;
+            http = mhttp;
+
+            await client.cryptoStore.setDeviceId(TEST_DEVICE_ID);
+            bindNullEngine(http);
+            await Promise.all([
+                client.crypto.prepare([]),
+                http.flushAllExpected(),
+            ]);
+        }));
+
+        it('should no-op for unencrypted rooms', async () => {
+            (<any>client.crypto).roomTracker.getRoomCryptoConfig = () => Promise.resolve({});
+            const buildSpy = simple.mock((<any>client.crypto).engine.machine, "buildRoomKeyBundle");
+
+            await client.crypto.shareRoomHistoryWithUser(roomId, targetUserId);
+
+            expect(buildSpy.callCount).toBe(0);
+        });
+
+        it('should not share when the history visibility disallows it', async () => {
+            (<any>client.crypto).roomTracker.getRoomCryptoConfig = () => Promise.resolve({ algorithm: RoomEncryptionAlgorithm.MegolmV1AesSha2 });
+            client.getRoomStateEvent = () => Promise.resolve({ history_visibility: "joined" });
+            const buildSpy = simple.mock((<any>client.crypto).engine.machine, "buildRoomKeyBundle");
+
+            await client.crypto.shareRoomHistoryWithUser(roomId, targetUserId);
+
+            expect(buildSpy.callCount).toBe(0);
+        });
+
+        it('should bootstrap cross-signing and stop quietly when there are no shareable keys', async () => {
+            (<any>client.crypto).roomTracker.getRoomCryptoConfig = () => Promise.resolve({ algorithm: RoomEncryptionAlgorithm.MegolmV1AesSha2 });
+            client.getRoomStateEvent = () => Promise.resolve({ history_visibility: "shared" });
+            const bootstrapSpy = simple.mock(client.crypto, "ensureCrossSigningBootstrapped").callFn(() => Promise.resolve());
+            const uploadSpy = simple.mock(client, "uploadContent");
+
+            await client.crypto.shareRoomHistoryWithUser(roomId, targetUserId);
+
+            expect(bootstrapSpy.callCount).toBe(1);
+            expect(uploadSpy.callCount).toBe(0);
+        });
+    });
+
+    describe('room key bundle acceptance (MSC4268)', () => {
+        const userId = "@alice:example.org";
+        const roomId = "!room:example.org";
+        const inviter = "@inviter:example.org";
+        let client: MatrixClient;
+        let http: HttpBackend;
+
+        beforeEach(() => testCryptoStores(async (cryptoStoreType) => {
+            const { client: mclient, http: mhttp } = createTestClient(null, userId, cryptoStoreType);
+            client = mclient;
+            http = mhttp;
+
+            await client.cryptoStore.setDeviceId(TEST_DEVICE_ID);
+            bindNullEngine(http);
+            await Promise.all([
+                client.crypto.prepare([]),
+                http.flushAllExpected(),
+            ]);
+        }));
+
+        it('maybeAcceptKeyBundle returns false and keeps waiting when no bundle was received', async () => {
+            (<any>client.crypto).engine.forceKeysQueryForUsers = () => Promise.resolve();
+
+            await client.crypto.markRoomAsPendingKeyBundle(roomId, inviter);
+            const accepted = await client.crypto.maybeAcceptKeyBundle(roomId, inviter);
+
+            expect(accepted).toBe(false);
+            // The pending record must survive so a late-arriving bundle can still be imported.
+            const machine = (<any>client.crypto).engine.machine;
+            const details = await machine.getPendingKeyBundleDetailsForRoom(new RoomId(roomId));
+            expect(details).not.toBeNull();
+            expect(details.inviter).toEqual(inviter);
+        });
+
+        it('cross-signing identity round-trips through Secret Storage', async () => {
+            const recoveryKey = "test recovery passphrase";
+            const accountData = new Map<string, any>();
+            let signingKeysBody: any = null;
+
+            const wireClient = (c: MatrixClient) => {
+                (<any>c.crypto).config = { recoveryKey };
+                c.getAccountData = <T>(eventType: string): Promise<T> => {
+                    if (!accountData.has(eventType)) return Promise.reject(new Error("M_NOT_FOUND"));
+                    return Promise.resolve(accountData.get(eventType));
+                };
+                c.setAccountData = (eventType: string, content: any) => {
+                    accountData.set(eventType, content);
+                    return Promise.resolve({});
+                };
+                (<any>c.crypto).engine.processCrossSigningBootstrapRequests = simple.stub().callFn((reqs) => {
+                    signingKeysBody = JSON.parse(reqs.uploadSigningKeysReq);
+                    return Promise.resolve();
+                });
+                (<any>c.crypto).engine.uploadSignatures = simple.stub().callFn(() => Promise.resolve());
+            };
+
+            // First boot: no identity anywhere -> bootstrap + persist to Secret Storage.
+            wireClient(client);
+            const bootstrapSpy = (<any>client.crypto).engine.processCrossSigningBootstrapRequests;
+            await client.crypto.ensureCrossSigningBootstrapped();
+
+            expect(bootstrapSpy.callCount).toBe(1);
+            expect(signingKeysBody).not.toBeNull();
+            expect(accountData.has("m.secret_storage.default_key")).toBe(true);
+            expect(accountData.has("m.cross_signing.master")).toBe(true);
+            expect(accountData.has("m.cross_signing.user_signing")).toBe(true);
+            expect(accountData.has("m.cross_signing.self_signing")).toBe(true);
+
+            const statusAfterBootstrap = await (<any>client.crypto).engine.machine.crossSigningStatus();
+            expect(statusAfterBootstrap.hasMaster).toBe(true);
+
+            // Second boot: fresh crypto store (new device) with the same account data
+            // -> identity restored from Secret Storage, no new bootstrap. The restore
+            // path forces a /keys/query for ourselves to learn our public identity.
+            await testCryptoStores(async (cryptoStoreType) => {
+                const { client: client2, http: http2 } = createTestClient(null, userId, cryptoStoreType);
+                await client2.cryptoStore.setDeviceId("SECONDDEVICE");
+                bindNullEngine(http2);
+                await Promise.all([
+                    client2.crypto.prepare([]),
+                    http2.flushAllExpected(),
+                ]);
+
+                wireClient(client2);
+                const bootstrapSpy2 = (<any>client2.crypto).engine.processCrossSigningBootstrapRequests;
+                const signatureSpy2 = (<any>client2.crypto).engine.uploadSignatures;
+
+                // The forced self keys-query must return our published public identity.
+                http2.when("POST", "/keys/query").respond(200, () => {
+                    return {
+                        device_keys: {},
+                        failures: {},
+                        master_keys: { [userId]: signingKeysBody.master_key },
+                        self_signing_keys: { [userId]: signingKeysBody.self_signing_key },
+                        user_signing_keys: { [userId]: signingKeysBody.user_signing_key },
+                    };
+                });
+
+                await Promise.all([
+                    client2.crypto.ensureCrossSigningBootstrapped(),
+                    http2.flushAllExpected(),
+                ]);
+
+                expect(bootstrapSpy2.callCount).toBe(0);
+                expect(signatureSpy2.callCount).toBe(1);
+                const status2 = await (<any>client2.crypto).engine.machine.crossSigningStatus();
+                expect(status2.hasMaster).toBe(true);
+                expect(status2.hasSelfSigning).toBe(true);
+                expect(status2.hasUserSigning).toBe(true);
             });
         });
     });

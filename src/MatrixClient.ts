@@ -78,6 +78,14 @@ export class MatrixClient extends EventEmitter {
     public readonly crypto: CryptoClient;
 
     /**
+     * Whether to share encrypted room history with users when inviting them, as
+     * per [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
+     * Only applies when crypto is enabled; sharing is skipped automatically for
+     * rooms whose history visibility does not permit it.
+     */
+    public shareRoomHistoryOnInvite = true;
+
+    /**
      * The DM manager instance for this client.
      */
     public readonly dms: DMs;
@@ -88,6 +96,7 @@ export class MatrixClient extends EventEmitter {
     private impersonatedUserId: string;
     private impersonatedDeviceId: string;
     private joinStrategy: IJoinRoomStrategy = null;
+    private pendingKeyBundleInviters = new Map<string, string>();
     private eventProcessors: { [eventType: string]: IPreprocessor[] } = {};
     private filterId = 0;
     private stopSyncing = false;
@@ -551,12 +560,26 @@ export class MatrixClient extends EventEmitter {
 
     /**
      * Invites a user to a room.
+     *
+     * When crypto is enabled and `shareRoomHistoryOnInvite` is set, this first
+     * shares any shareable encrypted room history with the invitee as per
+     * [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268),
+     * so they can decrypt messages sent before they joined. Failures to share
+     * history are logged but never block the invite itself.
      * @param {string} userId the user ID to invite
      * @param {string} roomId the room ID to invite the user to
      * @returns {Promise<any>} resolves when completed
      */
     @timedMatrixClientFunctionCall()
-    public inviteUser(userId, roomId) {
+    public async inviteUser(userId, roomId) {
+        if (this.crypto?.isReady && this.shareRoomHistoryOnInvite) {
+            try {
+                await this.crypto.shareRoomHistoryWithUser(roomId, userId);
+            } catch (e) {
+                LogService.warn("MatrixClient", `Failed to share room history for ${roomId} with ${userId}:`, e);
+            }
+        }
+
         return this.doRequest("POST", "/_matrix/client/v3/rooms/" + encodeURIComponent(roomId) + "/invite", null, {
             user_id: userId,
         });
@@ -764,13 +787,15 @@ export class MatrixClient extends EventEmitter {
 
         if (!raw) return; // nothing to process
 
-        if (this.crypto) {
-            const inbox: IToDeviceMessage[] = [];
-            if (raw['to_device']?.['events']) {
-                inbox.push(...raw['to_device']['events']);
-                // TODO: Emit or do something with unknown messages?
-            }
+        const inbox: IToDeviceMessage[] = [];
+        if (raw['to_device']?.['events']) {
+            inbox.push(...raw['to_device']['events']);
+        }
+        for (const message of inbox) {
+            this.emit("to-device", message);
+        }
 
+        if (this.crypto) {
             let unusedFallbacks: OTKAlgorithm[] = [];
             if (raw['org.matrix.msc2732.device_unused_fallback_key_types']) {
                 unusedFallbacks = raw['org.matrix.msc2732.device_unused_fallback_key_types'];
@@ -862,6 +887,13 @@ export class MatrixClient extends EventEmitter {
             }
 
             inviteEvent = await this.processEvent(inviteEvent);
+            // Remember who invited us so that, if we join, we can accept an
+            // MSC4268 room key bundle from them. Recorded before the emit so
+            // that handlers which join immediately (eg AutojoinRoomsMixin)
+            // see the inviter.
+            if (this.crypto && inviteEvent['sender']) {
+                this.recordInviteForKeyBundle(roomId, inviteEvent['sender']);
+            }
             await emitFn("room.invite", roomId, inviteEvent);
         }
 
@@ -1053,8 +1085,35 @@ export class MatrixClient extends EventEmitter {
         };
 
         const userId = await this.getUserId();
-        if (this.joinStrategy) return this.joinStrategy.joinRoom(roomIdOrAlias, userId, apiCall);
-        else return apiCall(roomIdOrAlias);
+        const roomId = this.joinStrategy ? await this.joinStrategy.joinRoom(roomIdOrAlias, userId, apiCall) : await apiCall(roomIdOrAlias);
+
+        // If we joined from an invite, look for an MSC4268 room key bundle from
+        // the inviter so we can decrypt history shared with us. Never blocks or
+        // fails the join itself.
+        const inviter = this.pendingKeyBundleInviters.get(roomId);
+        if (inviter && this.crypto?.isReady) {
+            this.pendingKeyBundleInviters.delete(roomId);
+            try {
+                await this.crypto.markRoomAsPendingKeyBundle(roomId, inviter);
+                await this.crypto.maybeAcceptKeyBundle(roomId, inviter);
+            } catch (e) {
+                LogService.warn("MatrixClient", `Failed to process room key bundle for ${roomId} from ${inviter}:`, e);
+            }
+        }
+
+        return roomId;
+    }
+
+    /**
+     * Records that we were invited to a room by the given user, so that if we
+     * join the room, we can accept an MSC4268 room key bundle from them. This is
+     * recorded automatically for invites seen via /sync; appservices record it
+     * from transaction traffic.
+     * @param {string} roomId the room the invite is for
+     * @param {string} inviterUserId the user who sent the invite
+     */
+    public recordInviteForKeyBundle(roomId: string, inviterUserId: string) {
+        this.pendingKeyBundleInviters.set(roomId, inviterUserId);
     }
 
     /**

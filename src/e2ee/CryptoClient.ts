@@ -1,4 +1,5 @@
 import {
+    CollectStrategy,
     DeviceId,
     OlmMachine,
     UserId,
@@ -6,6 +7,8 @@ import {
     RoomId,
     Attachment,
     EncryptedAttachment,
+    SecretStorageItems,
+    SecretStorageKey,
 } from "@ixo/matrix-sdk-crypto-nodejs";
 
 import { MatrixClient } from "../MatrixClient";
@@ -34,10 +37,21 @@ import { BackupManager, KeyBackupInfo, BackupTrustInfo } from "./BackupManager";
 export interface CryptoClientConfig {
     /**
      * Base64-encoded recovery key for key backup.
-     * If provided, enables automatic key backup and recovery.
+     * If provided, enables automatic key backup and recovery, and is also used
+     * (as a passphrase) to protect the cross-signing identity in Secret
+     * Storage so that the identity survives crypto store resets.
      */
     recoveryKey?: string;
 }
+
+/**
+ * How long after accepting an invite we will still accept an MSC4268 room key
+ * bundle for the room. Mirrors matrix-js-sdk's
+ * MAX_INVITE_ACCEPTANCE_MS_FOR_KEY_BUNDLE.
+ */
+const MAX_INVITE_ACCEPTANCE_MS_FOR_KEY_BUNDLE = 24 * 60 * 60 * 1000; // 24 hours
+
+const ROOM_KEY_BUNDLE_EVENT_TYPES = ["m.room_key_bundle", "io.element.msc4268.room_key_bundle"];
 
 /**
  * Manages encryption for a MatrixClient. Get an instance from a MatrixClient directly
@@ -235,11 +249,13 @@ export class CryptoClient {
             changedDeviceLists.map(u => new UserId(u)),
             leftDeviceLists.map(u => new UserId(u)));
 
-        await this.engine.lock.acquire(SYNC_LOCK_NAME, async () => {
-            const syncResp = await this.engine.machine.receiveSyncChanges(deviceMessages, deviceLists, otkCounts, unusedFallbackKeyAlgs);
-            const decryptedToDeviceMessages = JSON.parse(syncResp);
-            if (Array.isArray(decryptedToDeviceMessages)) {
-                for (const msg of decryptedToDeviceMessages) {
+        const decryptedToDeviceMessages = await this.engine.lock.acquire(SYNC_LOCK_NAME, async () => {
+            const syncResp = JSON.parse(await this.engine.machine.receiveSyncChanges(deviceMessages, deviceLists, otkCounts, unusedFallbackKeyAlgs));
+            // The binding returns a tuple of [decryptedToDeviceMessages, roomKeyInfos]
+            // since 0.5.x; older versions returned the messages array directly.
+            const messages = Array.isArray(syncResp?.[0]) ? syncResp[0] : syncResp;
+            if (Array.isArray(messages)) {
+                for (const msg of messages) {
                     this.client.emit("to_device.decrypted", msg);
                 }
             }
@@ -250,7 +266,29 @@ export class CryptoClient {
             if (this.backupManager) {
                 await this.backupManager.maybeUploadKey();
             }
+
+            return Array.isArray(messages) ? messages : [];
         });
+
+        // If we received a room key bundle message for a room we recently joined
+        // from an invite, try to accept it. Runs outside the sync lock and
+        // without blocking the sync loop (mirrors matrix-js-sdk).
+        for (const msg of decryptedToDeviceMessages) {
+            if (!msg || !ROOM_KEY_BUNDLE_EVENT_TYPES.includes(msg["type"]) || typeof msg["content"]?.["room_id"] !== "string") continue;
+            const roomId = msg["content"]["room_id"];
+
+            const pendingDetails = await this.engine.machine.getPendingKeyBundleDetailsForRoom(new RoomId(roomId));
+            if (!pendingDetails) {
+                LogService.debug("CryptoClient", `Not accepting key bundle for room where we are not awaiting a bundle: ${roomId}`);
+            } else if (Date.now() - pendingDetails.inviteAcceptedAtMs > MAX_INVITE_ACCEPTANCE_MS_FOR_KEY_BUNDLE) {
+                LogService.info("CryptoClient", `Ignoring key bundle for room we joined too long ago: ${roomId}`);
+            } else {
+                LogService.info("CryptoClient", `Considering key bundle for recently-joined room ${roomId}`);
+                this.maybeAcceptKeyBundle(roomId, pendingDetails.inviter).catch(e => {
+                    LogService.warn("CryptoClient", `Error accepting key bundle for room ${roomId}:`, e);
+                });
+            }
+        }
     }
 
     /**
@@ -401,6 +439,296 @@ export class CryptoClient {
         );
         const decrypted = Attachment.decrypt(encrypted);
         return Buffer.from(decrypted);
+    }
+
+    /**
+     * Ensures the client's user has a cross-signing identity published, restoring
+     * it from Secret Storage when possible and bootstrapping a new one otherwise.
+     * Sharing room history (MSC4268) requires this: key bundles are only ever
+     * distributed identity-based, and the crypto layer refuses to send them when
+     * our own cross-signing is not set up.
+     *
+     * When a recovery key is configured, the cross-signing private keys are kept
+     * in Secret Storage (encrypted with a key derived from the recovery key), so
+     * that a crypto store reset restores the SAME identity instead of minting a
+     * new one — recipients would otherwise see the bot's identity change.
+     *
+     * The initial upload of cross-signing keys requires no user-interactive auth
+     * when the account has no existing keys (MSC3967), so this works for bots and
+     * appservice users.
+     */
+    @requiresReady()
+    public async ensureCrossSigningBootstrapped(): Promise<void> {
+        const status = await this.engine.machine.crossSigningStatus();
+        if (status.hasMaster && status.hasSelfSigning && status.hasUserSigning) {
+            // Self-heal partially-completed bootstraps: the private keys are in
+            // the store, but the device signature upload or the Secret Storage
+            // persist may not have happened.
+            await this.ensureOwnDeviceCrossSigned();
+            if (this.config.recoveryKey) {
+                try {
+                    await this.ensureCrossSigningPersisted();
+                } catch (e) {
+                    LogService.warn("CryptoClient", "Failed to persist cross-signing identity to Secret Storage:", e);
+                }
+            }
+            return;
+        }
+
+        // Try to restore an existing identity from Secret Storage first.
+        if (this.config.recoveryKey) {
+            try {
+                if (await this.tryRestoreCrossSigningFromSecretStorage()) {
+                    LogService.info("CryptoClient", "Restored cross-signing identity from Secret Storage");
+                    return;
+                }
+            } catch (e) {
+                LogService.warn("CryptoClient", "Failed to restore cross-signing from Secret Storage; bootstrapping fresh identity:", e);
+            }
+        }
+
+        LogService.info("CryptoClient", "Bootstrapping cross-signing for", await this.client.getUserId());
+        const requests = await this.engine.machine.bootstrapCrossSigning(false);
+        await this.engine.processCrossSigningBootstrapRequests(requests);
+
+        // Persist the new identity to Secret Storage so it survives store resets.
+        if (this.config.recoveryKey) {
+            try {
+                await this.persistCrossSigningToSecretStorage();
+                LogService.info("CryptoClient", "Stored cross-signing identity in Secret Storage");
+            } catch (e) {
+                LogService.warn("CryptoClient", "Failed to store cross-signing identity in Secret Storage:", e);
+            }
+        }
+    }
+
+    /**
+     * Make sure our own device carries a signature from our self-signing key,
+     * signing and uploading one if needed. Recipients only trust key bundles
+     * (and other identity-bound messages) from cross-signed devices.
+     */
+    private async ensureOwnDeviceCrossSigned(): Promise<void> {
+        const userId = await this.client.getUserId();
+        const device = await this.engine.machine.getDevice(new UserId(userId), new DeviceId(this.deviceId), undefined);
+        if (!device || device.isCrossSignedByOwner()) return;
+
+        LogService.info("CryptoClient", "Uploading cross-signing signature for own device");
+        const request = await device.verify();
+        await this.engine.uploadSignatures(request);
+    }
+
+    /**
+     * Make sure the cross-signing private keys are stored in Secret Storage,
+     * exporting them if they are not there yet.
+     */
+    private async ensureCrossSigningPersisted(): Promise<void> {
+        try {
+            await this.client.getAccountData("m.cross_signing.master");
+            return; // already persisted
+        } catch (e) {
+            // fall through to persist
+        }
+        await this.persistCrossSigningToSecretStorage();
+        LogService.info("CryptoClient", "Stored cross-signing identity in Secret Storage");
+    }
+
+    /**
+     * Fetch the default Secret Storage key described in account data, unlocked
+     * with the configured recovery key. Returns null when no key is set up.
+     */
+    private async getSecretStorageKey(): Promise<SecretStorageKey | null> {
+        let defaultKey: { key?: string };
+        try {
+            defaultKey = await this.client.getAccountData<{ key?: string }>("m.secret_storage.default_key");
+        } catch (e) {
+            return null;
+        }
+        if (!defaultKey?.key) return null;
+
+        const eventType = `m.secret_storage.key.${defaultKey.key}`;
+        let keyContent: unknown;
+        try {
+            keyContent = await this.client.getAccountData(eventType);
+        } catch (e) {
+            return null;
+        }
+
+        return SecretStorageKey.fromAccountData(this.config.recoveryKey, eventType, JSON.stringify(keyContent));
+    }
+
+    /**
+     * Fetch the default Secret Storage key, creating (and publishing) one derived
+     * from the recovery key if none exists yet.
+     */
+    private async getOrCreateSecretStorageKey(): Promise<SecretStorageKey> {
+        const existing = await this.getSecretStorageKey();
+        if (existing) return existing;
+
+        const key = SecretStorageKey.createFromPassphrase(this.config.recoveryKey);
+        await this.client.setAccountData(`m.secret_storage.key.${key.keyId()}`, JSON.parse(key.accountDataContent()));
+        await this.client.setAccountData("m.secret_storage.default_key", { key: key.keyId() });
+        return key;
+    }
+
+    /**
+     * Attempt to import the cross-signing private keys from Secret Storage.
+     * Importing also self-signs this device; the resultant signature is uploaded.
+     * @returns True when the identity was restored.
+     */
+    private async tryRestoreCrossSigningFromSecretStorage(): Promise<boolean> {
+        const key = await this.getSecretStorageKey();
+        if (!key) return false;
+
+        const secrets: Record<string, string> = {};
+        for (const [name, type] of [
+            ["masterKey", "m.cross_signing.master"],
+            ["userSigningKey", "m.cross_signing.user_signing"],
+            ["selfSigningKey", "m.cross_signing.self_signing"],
+        ]) {
+            try {
+                secrets[name] = JSON.stringify(await this.client.getAccountData(type));
+            } catch (e) {
+                LogService.debug("CryptoClient", `Secret ${type} not found in account data`);
+                return false;
+            }
+        }
+
+        // The machine must know our own PUBLIC cross-signing keys before it can
+        // import the private ones (this device may have a fresh store).
+        await this.engine.forceKeysQueryForUsers([await this.client.getUserId()]);
+
+        const signatureRequest = await this.engine.machine.importSecretsFromSecretStorage(key, new SecretStorageItems(secrets));
+        await this.engine.uploadSignatures(signatureRequest);
+        return true;
+    }
+
+    /**
+     * Encrypt the cross-signing private keys with the Secret Storage key and
+     * publish them to account data.
+     */
+    private async persistCrossSigningToSecretStorage(): Promise<void> {
+        const key = await this.getOrCreateSecretStorageKey();
+        const items = await this.engine.machine.exportSecretsForSecretStorage(key);
+        await this.client.setAccountData("m.cross_signing.master", JSON.parse(items.masterKey));
+        await this.client.setAccountData("m.cross_signing.user_signing", JSON.parse(items.userSigningKey));
+        await this.client.setAccountData("m.cross_signing.self_signing", JSON.parse(items.selfSigningKey));
+    }
+
+    /**
+     * Record that we have accepted an invite for the given room, so that an
+     * MSC4268 room key bundle arriving from the inviter soon should be accepted.
+     * @param {string} roomId The room we were invited to.
+     * @param {string} inviter The user who invited us.
+     */
+    @requiresReady()
+    public async markRoomAsPendingKeyBundle(roomId: string, inviter: string): Promise<void> {
+        await this.engine.machine.storeRoomPendingKeyBundle(new RoomId(roomId), new UserId(inviter));
+    }
+
+    /**
+     * Having accepted an invite for the given room from the given user, attempt
+     * to find information about a room key bundle and, if found, download the
+     * bundle and import the room keys, as per
+     * [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
+     *
+     * The bundle is only imported when the crypto layer can attribute it to the
+     * inviter with sufficient trust (the sending device must be cross-signed by
+     * the inviter).
+     * @param {string} roomId The room we were invited to.
+     * @param {string} inviter The user who invited us and is expected to have sent the bundle.
+     * @returns {Promise<boolean>} True if a bundle was found, downloaded and imported.
+     */
+    @requiresReady()
+    public async maybeAcceptKeyBundle(roomId: string, inviter: string): Promise<boolean> {
+        // Make sure we have an up-to-date idea of the inviter's cross-signing keys,
+        // so that we can check the device that sent us the bundle was cross-signed.
+        await this.engine.forceKeysQueryForUsers([inviter]);
+
+        const bundleData = await this.engine.machine.getReceivedRoomKeyBundleData(new RoomId(roomId), new UserId(inviter));
+        if (!bundleData) {
+            LogService.debug("CryptoClient", `No key bundle found for room ${roomId} from ${inviter}`);
+            return false;
+        }
+
+        LogService.info("CryptoClient", `Fetching key bundle ${bundleData.url} for room ${roomId}`);
+        const encryptedBundle = (await this.client.downloadContent(bundleData.url)).data;
+
+        try {
+            await this.engine.machine.receiveRoomKeyBundle(bundleData, new Uint8Array(encryptedBundle));
+        } finally {
+            // Even if the import failed, stop waiting for a bundle: the only
+            // reason it can fail is a malformed bundle, so retrying won't help.
+            await this.engine.machine.clearRoomPendingKeyBundle(new RoomId(roomId));
+        }
+        return true;
+    }
+
+    /**
+     * Shares any shareable encrypted room history with the given user, as per
+     * [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
+     * Call this immediately before inviting the user to the room, so that the
+     * key bundle is waiting for them when they accept.
+     *
+     * No-ops when the room is unencrypted, when its *current* history visibility
+     * does not permit sharing (`joined`/`invited`), or when there are no
+     * shareable keys. Note that only megolm sessions flagged with
+     * `shared_history` (created by clients with MSC4268 support while the room
+     * visibility allowed it) are included; the recipient's devices must be
+     * cross-signed by the recipient to receive the bundle.
+     * @param {string} roomId The room to share history for.
+     * @param {string} userId The user to share history with.
+     */
+    @requiresReady()
+    public async shareRoomHistoryWithUser(roomId: string, userId: string): Promise<void> {
+        if (!(await this.isRoomEncrypted(roomId))) return;
+
+        // Only share history if the *current* visibility allows it. Per the
+        // spec, rooms without a history visibility event default to "shared".
+        let historyVisibility = "shared";
+        try {
+            const ev = await this.client.getRoomStateEvent(roomId, "m.room.history_visibility", "");
+            historyVisibility = ev?.["history_visibility"] ?? "shared";
+        } catch (e) {
+            // Missing event: fall through with the "shared" default.
+        }
+        if (historyVisibility === "joined" || historyVisibility === "invited") {
+            LogService.debug("CryptoClient", `Not sharing history for ${roomId}: history visibility is ${historyVisibility}`);
+            return;
+        }
+
+        await this.ensureCrossSigningBootstrapped();
+
+        // Pull any keys we're missing from backup first, so the bundle covers
+        // messages sent while this device was offline.
+        if (this.backupManager && !(await this.engine.machine.hasDownloadedAllRoomKeys(new RoomId(roomId)))) {
+            try {
+                await this.backupManager.importRoomKeysFromBackup(roomId);
+                await this.engine.machine.setHasDownloadedAllRoomKeys(new RoomId(roomId));
+            } catch (e) {
+                LogService.warn("CryptoClient", `Failed to restore backup keys for ${roomId} before sharing history:`, e);
+            }
+        }
+
+        const bundle = await this.engine.machine.buildRoomKeyBundle(new RoomId(roomId));
+        if (!bundle) {
+            LogService.debug("CryptoClient", `No shareable keys in ${roomId}; not sending a key bundle`);
+            return;
+        }
+
+        const mxcUri = await this.client.uploadContent(Buffer.from(bundle.encryptedData), "application/octet-stream");
+
+        await this.engine.ensureSessionsForUsers([userId]);
+
+        const requests = await this.engine.machine.shareRoomKeyBundleData(
+            new UserId(userId),
+            new RoomId(roomId),
+            mxcUri,
+            bundle.mediaEncryptionInfo,
+            CollectStrategy.IdentityBasedStrategy,
+        );
+        await this.engine.sendToDeviceRequests(requests);
+
+        LogService.info("CryptoClient", `Shared room history bundle for ${roomId} with ${userId} (${requests.length} to-device request(s))`);
     }
 
     // ==================== Key Backup Methods ====================

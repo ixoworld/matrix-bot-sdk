@@ -653,6 +653,13 @@ export class Appservice extends EventEmitter {
         } else if (targetMembership === "ban" || targetMembership === "leave") {
             this.emit("room.leave", event["room_id"], event);
         } else if (targetMembership === "invite") {
+            // Remember who invited this appservice user so that, if the intent
+            // joins, it can accept an MSC4268 room key bundle from the inviter.
+            // Recorded before the emit so handlers which join immediately (eg
+            // AutojoinRoomsMixin) see the inviter.
+            if (event['sender']) {
+                intent.underlyingClient.recordInviteForKeyBundle(event["room_id"], event["sender"]);
+            }
             this.emit("room.invite", event["room_id"], event);
         }
     }

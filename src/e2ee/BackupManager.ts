@@ -620,6 +620,72 @@ export class BackupManager {
     }
 
     /**
+     * Restore all keys for a single room from backup.
+     *
+     * Downloads the backed up keys for the given room, decrypts them, and imports
+     * them into the OlmMachine. Used before building an MSC4268 room key bundle so
+     * that the bundle covers keys this device may have missed.
+     *
+     * @param roomId The room ID to restore keys for.
+     * @returns The count of total and imported keys.
+     */
+    public async importRoomKeysFromBackup(roomId: string): Promise<KeyBackupRestoreResult> {
+        const version = this.activeBackupVersion;
+        if (!version) {
+            throw new Error("No active backup version");
+        }
+
+        if (!this.decryptionKey) {
+            throw new Error("No decryption key available - provide recovery key during initialization");
+        }
+
+        let roomBackup: { sessions: Record<string, KeyBackupSessionData> };
+        try {
+            roomBackup = await this.client.doRequest(
+                "GET",
+                `/_matrix/client/v3/room_keys/keys/${encodeURIComponent(roomId)}`,
+                { version },
+            );
+        } catch (e) {
+            if (e?.body?.errcode === "M_NOT_FOUND") {
+                return { total: 0, imported: 0 };
+            }
+            throw e;
+        }
+
+        const keysToImport: ExportedRoomKey[] = [];
+        let total = 0;
+
+        for (const [sessionId, sessionData] of Object.entries(roomBackup.sessions || {})) {
+            total++;
+            try {
+                const decryptedSession = this.decryptSession(sessionData);
+                keysToImport.push({
+                    algorithm: decryptedSession.algorithm as string || "m.megolm.v1.aes-sha2",
+                    room_id: roomId,
+                    sender_key: decryptedSession.sender_key as string,
+                    session_id: sessionId,
+                    session_key: decryptedSession.session_key as string,
+                    sender_claimed_keys: decryptedSession.sender_claimed_keys as Record<string, string> || {},
+                    forwarding_curve25519_key_chain: decryptedSession.forwarding_curve25519_key_chain as string[] || [],
+                });
+            } catch (e) {
+                LogService.warn("BackupManager", `Failed to decrypt session ${sessionId} in room ${roomId}:`, e);
+            }
+        }
+
+        if (keysToImport.length > 0) {
+            const importResult = await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+                return await this.machine.importRoomKeys(JSON.stringify(keysToImport), version);
+            });
+            LogService.info("BackupManager", `Imported ${importResult.importedCount}/${total} backed up keys for room ${roomId}`);
+            return { total, imported: Number(importResult.importedCount) };
+        }
+
+        return { total, imported: 0 };
+    }
+
+    /**
      * Import a single session key from backup.
      *
      * Downloads and imports a specific session key - useful for on-demand key recovery

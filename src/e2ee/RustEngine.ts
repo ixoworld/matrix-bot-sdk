@@ -1,4 +1,5 @@
 import {
+    CrossSigningBootstrapRequests,
     EncryptionSettings,
     KeysClaimRequest,
     OlmMachine,
@@ -92,6 +93,82 @@ export class RustEngine {
         });
     }
 
+    /**
+     * Force a fresh /keys/query for the given users, without waiting for the
+     * device tracker to consider them outdated. Used to get an up-to-date view
+     * of a user's devices and cross-signing identity before sharing or
+     * accepting an MSC4268 room key bundle.
+     */
+    public async forceKeysQueryForUsers(userIds: string[]) {
+        await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+            const uids = userIds.map(u => new UserId(u));
+            await this.machine.updateTrackedUsers(uids);
+            const request = this.machine.queryKeysForUsers(uids);
+            await this.processKeysQueryRequest(request);
+        });
+    }
+
+    /**
+     * Fetch a fresh device list for the given users and establish Olm sessions
+     * with any of their devices we do not have a session with yet.
+     */
+    public async ensureSessionsForUsers(userIds: string[]) {
+        await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+            const uids = userIds.map(u => new UserId(u));
+            await this.machine.updateTrackedUsers(uids);
+            const request = this.machine.queryKeysForUsers(uids);
+            await this.processKeysQueryRequest(request);
+
+            const keysClaim = await this.machine.getMissingSessions(uids);
+            if (keysClaim) {
+                await this.processKeysClaimRequest(keysClaim);
+            }
+        });
+    }
+
+    /**
+     * Upload a signature request (e.g. produced by importing cross-signing
+     * secrets, which self-signs the device).
+     */
+    public async uploadSignatures(request: SignatureUploadRequest) {
+        await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+            await this.processSignatureUploadRequest(request);
+        });
+    }
+
+    /**
+     * Send a batch of to-device requests produced by the OlmMachine (outside of
+     * the outgoingRequests loop), marking each as sent.
+     */
+    public async sendToDeviceRequests(requests: ToDeviceRequest[]) {
+        await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+            for (const request of requests) {
+                await this.processToDeviceRequest(request);
+            }
+        });
+    }
+
+    /**
+     * Upload the cross-signing keys produced by `OlmMachine.bootstrapCrossSigning`.
+     *
+     * The signing-keys request has no request ID and must not be marked as sent;
+     * the device-keys and signatures requests go through the normal processors.
+     */
+    public async processCrossSigningBootstrapRequests(requests: CrossSigningBootstrapRequests) {
+        await this.lock.acquire(SYNC_LOCK_NAME, async () => {
+            if (requests.uploadKeysReq) {
+                await this.processKeysUploadRequest(requests.uploadKeysReq);
+            }
+            await this.client.doRequest(
+                "POST",
+                "/_matrix/client/v3/keys/device_signing/upload",
+                null,
+                JSON.parse(requests.uploadSigningKeysReq),
+            );
+            await this.processSignatureUploadRequest(requests.uploadSignaturesReq);
+        });
+    }
+
     public async prepareEncrypt(roomId: string, roomInfo: ICryptoRoomInformation) {
         // TODO: Handle pre-shared invite keys too
         const members = (await this.client.getJoinedRoomMembers(roomId)).map(u => new UserId(u));
@@ -169,7 +246,11 @@ export class RustEngine {
 
     private async processToDeviceRequest(request: ToDeviceRequest) {
         const req = JSON.parse(request.body);
-        await this.actuallyProcessToDeviceRequest(req.txn_id, req.event_type, req.messages);
+        // Prefer the request's own accessors: depending on the bindings version
+        // and code path, the body JSON may or may not embed txn_id/event_type.
+        const txnId = request.txnId ?? req.txn_id;
+        const eventType = request.eventType ?? req.event_type;
+        await this.actuallyProcessToDeviceRequest(txnId, eventType, req.messages ?? req);
     }
 
     private async actuallyProcessToDeviceRequest(id: string, type: string, messages: Record<string, Record<string, unknown>>) {
@@ -178,13 +259,21 @@ export class RustEngine {
     }
 
     private async processSignatureUploadRequest(request: SignatureUploadRequest) {
+        // The bindings serialize the request with its `signed_keys` wrapper, but
+        // the wire format of POST /keys/signatures/upload is the bare map of
+        // user ID -> key ID -> signed object.
+        const body = JSON.parse(request.body);
         const resp = await this.client.doRequest(
             "POST",
             "/_matrix/client/v3/keys/signatures/upload",
             null,
-            JSON.parse(request.body),
+            body?.["signed_keys"] ?? body,
         );
-        await this.machine.markRequestAsSent(request.id, request.type, JSON.stringify(resp));
+        // Requests produced outside the outgoingRequests loop (eg cross-signing
+        // bootstrap) are synthetic and carry no transaction ID to mark as sent.
+        if (request.id) {
+            await this.machine.markRequestAsSent(request.id, request.type, JSON.stringify(resp));
+        }
     }
 
     private async processKeysBackupRequest(request: KeysBackupRequest) {
