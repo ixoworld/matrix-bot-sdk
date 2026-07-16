@@ -1,6 +1,6 @@
 {
   "name": "@ixo/matrix-bot-sdk",
-  "version": "0.8.0-ixo.12",
+  "version": "0.8.0-ixo.13",
   "description": "TypeScript/JavaScript SDK for Matrix bots and appservices (ixo fork)",
   "repository": {
     "type": "git",
@@ -52,7 +52,7 @@
     "tsconfig.json"
   ],
   "dependencies": {
-    "@ixo/matrix-sdk-crypto-nodejs": "^0.4.2",
+    "@ixo/matrix-sdk-crypto-nodejs": "^0.6.1-ixo.1",
     "@types/express": "^4.17.20",
     "another-json": "^0.2.0",
     "async-lock": "^1.4.0",

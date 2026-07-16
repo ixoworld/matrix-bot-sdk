@@ -470,10 +470,10 @@
   resolved "https://registry.npmjs.org/@istanbuljs/schema/-/schema-0.1.3.tgz#e45e384e4b8ec16bce2fd903af78450f6bf7ec98"
   integrity sha512-ZXRY4jNvVgSVQ8DL3LTcakaAtXwTVUxE81hslsyD2AtoXW/wVob10HkOJ1X/pAlcI7D+2YoZKg5do8G/w6RYgA==
 
-"@ixo/matrix-sdk-crypto-nodejs@^0.4.2":
-  version "0.4.2"
-  resolved "https://registry.npmjs.org/@ixo/matrix-sdk-crypto-nodejs/-/matrix-sdk-crypto-nodejs-0.4.2.tgz#e24bcb63c514e22d358e8bd7db3a176ae13dcfd4"
-  integrity sha512-kzDNrsr9CojYX+8JfrND+/KbNRDcliwkaY9FTxo8OCM3ye7a4n2RmV6qo4jfRA4V9IqYA0G++s2Sr7XLMEhdng==
+"@ixo/matrix-sdk-crypto-nodejs@^0.6.1-ixo.1":
+  version "0.6.1-ixo.1"
+  resolved "https://registry.yarnpkg.com/@ixo/matrix-sdk-crypto-nodejs/-/matrix-sdk-crypto-nodejs-0.6.1-ixo.1.tgz#5bd057c73cea2e35a995bfbd69562e77c55e72a6"
+  integrity sha512-YQJ1wbnDgcJ32aCiIgypXXcyqUdciNhIPKCHTfmklUuI0JDgWIoXr7QwSpNMhIVx1O+fIBGQWZIJd2AePj5eXQ==
   dependencies:
     https-proxy-agent "^7.0.5"
     node-downloader-helper "^2.1.9"

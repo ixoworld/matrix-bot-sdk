@@ -8,6 +8,10 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for OIDC trusted publishing to npmjs.com.
+      id-token: write
 
     steps:
       - name: Checkout
@@ -16,9 +20,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-          scope: '@ixo'
+          # Node 24 bundles npm >= 11.5, which supports OIDC trusted
+          # publishing. No registry-url/token setup: setup-node's generated
+          # .npmrc would reference a NODE_AUTH_TOKEN env var that is never set.
+          node-version: '24'
 
       - name: Install dependencies
         run: yarn install --frozen-lockfile
@@ -42,5 +47,3 @@ jobs:
       - name: Publish to npm
         if: steps.version-check.outputs.changed == 'true'
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
