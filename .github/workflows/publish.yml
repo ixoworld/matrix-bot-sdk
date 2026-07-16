@@ -46,4 +46,6 @@ jobs:
 
       - name: Publish to npm
         if: steps.version-check.outputs.changed == 'true'
-        run: npm publish --access public
+        # npm >= 11 requires an explicit tag for prerelease-style versions,
+        # which our -ixo.N versions are; they are always our latest.
+        run: npm publish --access public --tag latest
