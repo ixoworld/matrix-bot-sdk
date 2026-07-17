@@ -45,26 +45,78 @@ describe('CryptoClient', () => {
     }));
 
     describe('prepare', () => {
-        it('should prepare the room tracker', () => testCryptoStores(async (cryptoStoreType) => {
+        it('should schedule a deferred room scan without blocking startup', () => testCryptoStores(async (cryptoStoreType) => {
             const userId = "@alice:example.org";
             const roomIds = ["!a:example.org", "!b:example.org"];
             const { client, http } = createTestClient(null, userId, cryptoStoreType);
 
             client.getWhoAmI = () => Promise.resolve({ user_id: userId, device_id: TEST_DEVICE_ID });
+            client.getJoinedRooms = () => Promise.resolve(roomIds);
 
+            // The scan never resolves: if it were on the startup path,
+            // crypto.prepare below would hang instead of resolving.
             const prepareSpy = simple.stub().callFn((rids: string[]) => {
-                expect(rids).toBe(roomIds);
-                return Promise.resolve();
+                expect(rids).toEqual(roomIds);
+                return new Promise(() => void 0);
             });
-
             (<any>client.crypto).roomTracker.prepare = prepareSpy; // private member access
+            (<any>client.crypto).roomScanDelayMs = 5;
 
             bindNullEngine(http);
             await Promise.all([
                 client.crypto.prepare(roomIds),
                 http.flushAllExpected(),
             ]);
-            expect(prepareSpy.callCount).toEqual(1);
+            expect(client.crypto.isReady).toEqual(true);
+
+            await new Promise(r => setTimeout(r, 50));
+            expect(prepareSpy.callCount).toEqual(1); // ran deferred, exactly once
+        }));
+
+        it('should contain a failing deferred room scan', () => testCryptoStores(async (cryptoStoreType) => {
+            const userId = "@alice:example.org";
+            const { client, http } = createTestClient(null, userId, cryptoStoreType);
+
+            client.getWhoAmI = () => Promise.resolve({ user_id: userId, device_id: TEST_DEVICE_ID });
+            client.getJoinedRooms = () => Promise.resolve([]);
+
+            (<any>client.crypto).roomTracker.prepare = () => Promise.reject(new Error("Simulated failure"));
+            (<any>client.crypto).roomScanDelayMs = 5;
+
+            bindNullEngine(http);
+            await Promise.all([
+                client.crypto.prepare(["!a:example.org"]),
+                http.flushAllExpected(),
+            ]);
+            expect(client.crypto.isReady).toEqual(true);
+            await new Promise(r => setTimeout(r, 50));
+            // No assertion beyond "no unhandled rejection".
+        }));
+
+        it('should not run the deferred room scan when cancelled', () => testCryptoStores(async (cryptoStoreType) => {
+            const userId = "@alice:example.org";
+            const { client, http } = createTestClient(null, userId, cryptoStoreType);
+
+            client.getWhoAmI = () => Promise.resolve({ user_id: userId, device_id: TEST_DEVICE_ID });
+            client.getJoinedRooms = () => Promise.resolve([]);
+
+            const prepareSpy = simple.stub().callFn(() => Promise.resolve());
+            (<any>client.crypto).roomTracker.prepare = prepareSpy;
+            // Long delay so the timer cannot fire during machine init; the
+            // cancellation is verified via the cleared handle plus a short wait.
+            (<any>client.crypto).roomScanDelayMs = 5000;
+
+            bindNullEngine(http);
+            await Promise.all([
+                client.crypto.prepare(["!a:example.org"]),
+                http.flushAllExpected(),
+            ]);
+            expect((<any>client.crypto).roomScanTimer).toBeTruthy();
+            client.crypto.cancelDeferredRoomScan();
+            expect((<any>client.crypto).roomScanTimer).toBeNull();
+
+            await new Promise(r => setTimeout(r, 30));
+            expect(prepareSpy.callCount).toEqual(0);
         }));
 
         it('should use a stored device ID', () => testCryptoStores(async (cryptoStoreType) => {

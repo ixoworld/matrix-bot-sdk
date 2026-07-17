@@ -1488,6 +1488,140 @@ describe('MatrixClient', () => {
             expect(spy.callCount).toBe(1);
         });
 
+        it('should feed crypto-relevant state section events to the crypto client', async () => {
+            const { client: realClient } = createTestClient();
+            const client = <ProcessSyncClient>(<any>realClient);
+
+            const userId = "@syncing:example.org";
+            const roomId = "!room:example.org";
+            client.userId = userId;
+
+            // A gappy/limited sync delivers state changes from the gap only in the
+            // state section; these must reach the room tracker.
+            const onRoomEventSpy = simple.stub().callFn((rid: string, ev: any) => {
+                expect(rid).toEqual(roomId);
+                expect(["m.room.encryption", "m.room.history_visibility"]).toContain(ev["type"]);
+                return Promise.resolve();
+            });
+            (<any>realClient).crypto = {
+                updateSyncData: () => Promise.resolve(),
+                onRoomEvent: onRoomEventSpy,
+                isRoomEncrypted: () => Promise.resolve(false),
+            };
+
+            const roomsObj = {};
+            roomsObj[roomId] = {
+                state: {
+                    events: [
+                        { type: "m.room.encryption", state_key: "", content: { algorithm: "m.megolm.v1.aes-sha2" } },
+                        { type: "m.room.history_visibility", state_key: "", content: { history_visibility: "shared" } },
+                        { type: "m.room.topic", state_key: "", content: { topic: "irrelevant" } },
+                        { type: "m.room.member", state_key: userId, content: { membership: "join" } },
+                    ],
+                },
+                // No timeline: the state section must be processed regardless.
+            };
+            await client.processSync({ rooms: { join: roomsObj } });
+            expect(onRoomEventSpy.callCount).toBe(2);
+        });
+
+        it('should ignore state sections without a crypto client', async () => {
+            const { client: realClient } = createTestClient();
+            const client = <ProcessSyncClient>(<any>realClient);
+            client.userId = "@syncing:example.org";
+
+            const roomsObj = {};
+            roomsObj["!room:example.org"] = {
+                state: { events: [{ type: "m.room.encryption", state_key: "", content: {} }] },
+            };
+            // Must not throw.
+            await client.processSync({ rooms: { join: roomsObj } });
+        });
+
+        it('should decrypt an encrypted event arriving in the same sync as the state-section encryption event', async () => {
+            const { client: realClient } = createTestClient();
+            const client = <ProcessSyncClient>(<any>realClient);
+
+            const userId = "@syncing:example.org";
+            const roomId = "!room:example.org";
+            client.userId = userId;
+
+            // A room that turned encrypted while we were offline delivers the
+            // m.room.encryption event in the state section and ciphertext in
+            // the timeline of the SAME sync. The state section must be
+            // processed first or the decrypt gate would skip the event.
+            const decrypted = { type: "m.room.message", content: { body: "hello", msgtype: "m.text" }, sender: userId };
+            const encryptedRooms = new Set<string>();
+            const decryptSpy = simple.stub().callFn(() => Promise.resolve({ raw: decrypted }));
+            (<any>realClient).crypto = {
+                updateSyncData: () => Promise.resolve(),
+                onRoomEvent: (rid: string, ev: any) => {
+                    if (ev["type"] === "m.room.encryption") encryptedRooms.add(rid);
+                    return Promise.resolve();
+                },
+                isRoomEncrypted: (rid: string) => Promise.resolve(encryptedRooms.has(rid)),
+                decryptRoomEvent: decryptSpy,
+            };
+
+            const decryptedSpy = simple.stub().callFn((rid, ev) => {
+                expect(rid).toEqual(roomId);
+                expect(ev).toMatchObject(decrypted);
+            });
+            realClient.on("room.decrypted_event", decryptedSpy);
+
+            const roomsObj = {};
+            roomsObj[roomId] = {
+                state: {
+                    events: [
+                        { type: "m.room.encryption", state_key: "", content: { algorithm: "m.megolm.v1.aes-sha2" } },
+                    ],
+                },
+                timeline: {
+                    events: [
+                        {
+                            type: "m.room.encrypted",
+                            sender: userId,
+                            event_id: "$encrypted:example.org",
+                            content: { algorithm: "m.megolm.v1.aes-sha2", ciphertext: "irrelevant" },
+                        },
+                    ],
+                },
+            };
+            await client.processSync({ rooms: { join: roomsObj } });
+
+            expect(decryptSpy.callCount).toBe(1);
+            expect(decryptedSpy.callCount).toBe(1);
+        });
+
+        it('should cancel the deferred room scan when the client stops', async () => {
+            const { client: realClient } = createTestClient();
+
+            const cancelSpy = simple.stub();
+            (<any>realClient).crypto = { cancelDeferredRoomScan: cancelSpy };
+
+            realClient.stop();
+            expect(cancelSpy.callCount).toBe(1);
+        });
+
+        it('should fail a send rather than guess when the encryption state is unknown', async () => {
+            const { client: realClient } = createTestClient();
+            const roomId = "!room:example.org";
+
+            // The send gate must ask for fail-closed semantics: a transient
+            // failure to determine encryption state fails the send instead of
+            // risking plaintext into an encrypted room.
+            const encryptedSpy = simple.stub().callFn((rid: string, failClosed: boolean) => {
+                expect(rid).toEqual(roomId);
+                expect(failClosed).toBe(true);
+                return Promise.reject(new Error("Simulated state fetch failure"));
+            });
+            (<any>realClient).crypto = { isRoomEncrypted: encryptedSpy };
+
+            await expect(realClient.sendEvent(roomId, "m.room.message", { body: "hi", msgtype: "m.text" }))
+                .rejects.toThrow("Simulated state fetch failure");
+            expect(encryptedSpy.callCount).toBe(1);
+        });
+
         it('should process left rooms', async () => {
             const { client: realClient } = createTestClient();
             const client = <ProcessSyncClient>(<any>realClient);
