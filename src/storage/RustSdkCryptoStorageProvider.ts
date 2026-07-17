@@ -57,6 +57,16 @@ export class RustSdkCryptoStorageProvider implements ICryptoStorageProvider {
         const key = sha512().update(roomId).digest('hex');
         this.db.set(`rooms.${key}`, config).write();
     }
+
+    public async storeRooms(configs: Record<string, ICryptoRoomInformation>): Promise<void> {
+        // The FileSync adapter rewrites the entire database file on every
+        // write() — apply all updates in memory first and persist once.
+        for (const [roomId, config] of Object.entries(configs)) {
+            const key = sha512().update(roomId).digest('hex');
+            this.db.set(`rooms.${key}`, config).value();
+        }
+        this.db.write();
+    }
 }
 
 /**

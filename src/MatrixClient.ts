@@ -657,6 +657,7 @@ export class MatrixClient extends EventEmitter {
      */
     public stop() {
         this.stopSyncing = true;
+        this.crypto?.cancelDeferredRoomScan();
     }
 
     /**
@@ -904,6 +905,20 @@ export class MatrixClient extends EventEmitter {
             if (room['account_data'] && room['account_data']['events']) {
                 for (const event of room['account_data']['events']) {
                     await emitFn("room.account_data", roomId, event);
+                }
+            }
+
+            // On a gappy ("limited") sync, state changes that happened in the gap are
+            // only delivered in the state section — the timeline never sees them. Feed
+            // the crypto-relevant ones to the room tracker, or a room that enabled
+            // encryption while we were offline would still be treated as unencrypted
+            // (and be sent plaintext). Processed before the timeline so encrypted
+            // events later in this sync decrypt with up-to-date room state.
+            if (this.crypto && room['state']?.['events']) {
+                for (const event of room['state']['events']) {
+                    if (event['type'] === 'm.room.encryption' || event['type'] === 'm.room.history_visibility') {
+                        await this.crypto.onRoomEvent(roomId, event);
+                    }
                 }
             }
 
@@ -1432,7 +1447,10 @@ export class MatrixClient extends EventEmitter {
      */
     @timedMatrixClientFunctionCall()
     public async sendEvent(roomId: string, eventType: string, content: any): Promise<string> {
-        if (await this.crypto?.isRoomEncrypted(roomId)) {
+        // failClosed: if the room's encryption state cannot be determined, fail
+        // the send rather than guess "not encrypted" — the wrong guess would
+        // put plaintext into an encrypted room.
+        if (await this.crypto?.isRoomEncrypted(roomId, true)) {
             content = await this.crypto.encryptRoomEvent(roomId, eventType, content);
             eventType = "m.room.encrypted";
         }

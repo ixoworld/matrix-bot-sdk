@@ -33,4 +33,15 @@ export interface ICryptoStorageProvider {
      * to falsy if the room is unknown.
      */
     getRoom(roomId: string): Promise<ICryptoRoomInformation>;
+
+    /**
+     * Stores several rooms' configurations in one operation. Optional: callers fall back
+     * to per-room storeRoom() calls when not implemented. Implementations whose storeRoom()
+     * rewrites the whole database on every call (eg the lowdb file-backed store) should
+     * implement this so a bulk update (such as the startup room scan) persists in a
+     * single write.
+     * @param {Record<string, ICryptoRoomInformation>} configs Map of room ID to config.
+     * @returns {Promise<void>} Resolves when complete.
+     */
+    storeRooms?(configs: Record<string, ICryptoRoomInformation>): Promise<void>;
 }

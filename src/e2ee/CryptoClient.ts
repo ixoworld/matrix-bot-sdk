@@ -32,6 +32,13 @@ import { MembershipEvent } from "../models/events/MembershipEvent";
 import { BackupManager, KeyBackupInfo, BackupTrustInfo } from "./BackupManager";
 
 /**
+ * Delay before the one-off deferred room scan scheduled by prepare(). Kept
+ * well clear of the startup path: the scan is purely a warm-up/safety-net,
+ * correctness never depends on it.
+ */
+const ROOM_SCAN_DELAY_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
  * Configuration options for the crypto client.
  */
 export interface CryptoClientConfig {
@@ -67,6 +74,8 @@ export class CryptoClient {
     private engine: RustEngine;
     private backupManager: BackupManager | null = null;
     private config: CryptoClientConfig;
+    private roomScanTimer: ReturnType<typeof setTimeout> = null;
+    private roomScanDelayMs = ROOM_SCAN_DELAY_MS; // settable for tests
 
     public constructor(private client: MatrixClient, config?: CryptoClientConfig) {
         this.roomTracker = new RoomTracker(this.client);
@@ -104,7 +113,20 @@ export class CryptoClient {
      * @param {string[]} roomIds The room IDs the MatrixClient is joined to.
      */
     public async prepare(roomIds: string[]) {
-        await this.roomTracker.prepare(roomIds);
+        // One-off deferred room scan, well clear of the startup path: warms the
+        // store for encrypted rooms and picks up anything missed while offline.
+        // Correctness never depends on it — any room without a stored config is
+        // checked against the server on first use.
+        if (!this.roomScanTimer) {
+            this.roomScanTimer = setTimeout(async () => {
+                try {
+                    await this.roomTracker.prepare(await this.client.getJoinedRooms().catch(() => roomIds));
+                } catch (e) {
+                    LogService.warn("CryptoClient", "Deferred room scan failed:", e);
+                }
+            }, this.roomScanDelayMs);
+            this.roomScanTimer.unref?.();
+        }
 
         if (this.ready) return; // stop re-preparing here
 
@@ -217,13 +239,27 @@ export class CryptoClient {
     }
 
     /**
+     * Cancels the deferred room scan scheduled by prepare(). Call when
+     * shutting the client down.
+     */
+    public cancelDeferredRoomScan() {
+        if (this.roomScanTimer) {
+            clearTimeout(this.roomScanTimer);
+            this.roomScanTimer = null;
+        }
+    }
+
+    /**
      * Checks if a room is encrypted.
      * @param {string} roomId The room ID to check.
+     * @param {boolean} failClosed When true, a failure to determine the room's
+     * encryption state throws instead of returning false. Use on paths where a
+     * wrong "not encrypted" answer would leak plaintext into an encrypted room.
      * @returns {Promise<boolean>} Resolves to true if encrypted, false otherwise.
      */
     @requiresReady()
-    public async isRoomEncrypted(roomId: string): Promise<boolean> {
-        const config = await this.roomTracker.getRoomCryptoConfig(roomId);
+    public async isRoomEncrypted(roomId: string, failClosed = false): Promise<boolean> {
+        const config = await this.roomTracker.getRoomCryptoConfig(roomId, failClosed);
         return !!config?.algorithm;
     }
 
