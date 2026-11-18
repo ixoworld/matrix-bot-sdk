@@ -220,6 +220,7 @@ describe('Intent', () => {
             // noinspection TypeScriptValidateJSTypes
             http.when("GET", "/test").respond(200, (path, content, req) => {
                 expect(req.queryParams["user_id"]).toBe(userId);
+                expect(req.queryParams["device_id"]).toBe(deviceId);
                 expect(req.queryParams["org.matrix.msc3202.device_id"]).toBe(deviceId);
             });
 
@@ -268,6 +269,7 @@ describe('Intent', () => {
             // noinspection TypeScriptValidateJSTypes
             http.when("GET", "/test").respond(200, (path, content, req) => {
                 expect(req.queryParams["user_id"]).toBe(userId);
+                expect(req.queryParams["device_id"]).toBe(deviceId);
                 expect(req.queryParams["org.matrix.msc3202.device_id"]).toBe(deviceId);
             });
 
